@@ -129,26 +129,6 @@ class VarLong:
         return len(VarLong.write(value))
 
 
-def frame_size(buffer: bytes | bytearray, offset: int = 0) -> int:
-    """
-    只根据外层的「数据包长度」VarInt 计算整帧字节数。
-
-    这是字节透明转发的关键：**帧长度与是否压缩无关**，因此即使
-    载荷无法解析（例如解压失败），代理依然能够正确切分并转发。
-    数据不完整或长度非法时返回 0。
-    """
-    try:
-        total_len, len_bytes = VarInt.read(buffer, offset)
-    except Exception:
-        return 0
-    if total_len <= 0:
-        return 0
-    end = offset + len_bytes + total_len
-    if end > len(buffer):
-        return 0
-    return len_bytes + total_len
-
-
 def read_packet(buffer: bytes | bytearray, offset: int = 0, compression_threshold: int = -1) -> tuple[int, bytes, int]:
     """
     读取一个完整的 Minecraft 数据包，支持压缩。
@@ -231,19 +211,3 @@ def _read_compressed_packet(
         payload = decompressed[id_bytes:]
 
     return packet_id, payload, frame_len
-
-
-def build_packet(packet_id: int, payload: bytes) -> bytes:
-    """
-    构建一个Minecraft数据包
-
-    参数:
-        packet_id: 数据包ID
-        payload: 载荷数据
-
-    返回:
-        完整的包字节序列
-    """
-    id_bytes = VarInt.write(packet_id)
-    length = len(id_bytes) + len(payload)
-    return VarInt.write(length) + id_bytes + payload

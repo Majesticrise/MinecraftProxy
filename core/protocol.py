@@ -37,7 +37,6 @@ from .chunk_format import (
     parse_legacy_chunk_data_packet,
     parse_legacy_map_chunk_bulk_packet,
     parse_unload_chunk_packet,
-    parse_update_light_packet,
 )
 from .datatypes import PacketBuffer, write_string, write_varint
 from .logger import setup_logger
@@ -131,20 +130,6 @@ class ChunkData:
     data: bytes
     block_entities: list[dict] = field(default_factory=list)
     heightmaps: dict[str, Any] = field(default_factory=dict)
-    light: dict[str, Any] | None = None
-
-
-@dataclass
-class LightData:
-    """光照数据结构"""
-    chunk_x: int
-    chunk_z: int
-    sky_light_mask: list[int]
-    block_light_mask: list[int]
-    empty_sky_light_mask: list[int]
-    empty_block_light_mask: list[int]
-    sky_light_arrays: list[bytes]
-    block_light_arrays: list[bytes]
 
 
 DIMENSION_IDS = {
@@ -781,11 +766,6 @@ class ProtocolParser:
             logger.info(f"1.8 切换维度 ID={dimension} -> {self.dimension_name}")
         except Exception:
             pass
-
-    def _on_update_light(self, payload: bytes) -> None:
-        light = parse_update_light_packet(payload)
-        if light is not None:
-            logger.debug(f"光照更新: ({light.x}, {light.z})")
 
     def _on_block_entity_data(self, payload: bytes) -> None:
         entity = parse_block_entity_data_packet(payload)

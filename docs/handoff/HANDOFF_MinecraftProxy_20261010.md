@@ -8,7 +8,8 @@
 >   现按 `标准文件/` → `你想要的/` 依次探测；恢复后 **104/104 全部通过**
 > - 全文行数、行号、测试与静态检查数字按当前代码重新核对。
 >   测试实为 **665** 断言（含 15 项误判检查）——旧文档写的 587 与分项表加和不符
-> - 梳理出 **7 处已定义未使用的代码**（见第 10 节末尾「死代码清单」），未删除、待定夺
+> - 梳理出 **7 处已定义未使用的代码并于同日删除**（见第 10 节「死代码清理记录」），
+>   删除后 12 套件 665 断言、ruff、mypy 全部复验通过
 >
 > 自 2.1.0 起新增：多版本支持（1.8.9 / 1.16.5 / 1.17 / 1.18.2）、
 > 区块写入 fsync、写入任务 drain、内存上限、TCP_NODELAY、连接数上限、优雅停机；
@@ -160,16 +161,16 @@ MinecraftProxy/
 |---|---|---|---|
 | `main.py` | 新增 | 程序入口 + 命令行（唯一入口） | 260 |
 | `core/chunk_format.py` | 新增 | 区块包解析 + Anvil NBT 构建 | 1389 |
-| `core/protocol.py` | 新增 | 协议状态机、区块分发、维度跟踪、注册表收集 | 901 |
+| `core/protocol.py` | 新增 | 协议状态机、区块分发、维度跟踪、注册表收集 | 881 |
 | `core/packet_ids.py` | 新增 | 版本自适应 ID 解析 | 772 |
 | `core/chunk_extractor.py` | 新增 | `.mca` 扇区分配与外置区块 | 615 |
-| `core/block_registry.py` | 新增 | 方块 ID→名称映射（决定世界可用性） | 513 |
+| `core/block_registry.py` | 新增 | 方块 ID→名称映射（决定世界可用性） | 504 |
 | `core/proxy.py` | 新增 | 字节透明转发 + 背压 | 489 |
 | `core/legacy_blocks.py` | 新增 | 1.8 数字方块 ID → 现代方块名 | 377 |
 | `core/biome_registry.py` | 新增 | 生物群系 ID→名称（旧版数字表 + 1.18+ 网络注册表） | 346 |
 | `core/nbt.py` | 新增 | NBT 解析/序列化（含匿名标签） | 355 |
 | `core/level_dat.py` | 新增 | 生成可加载世界元数据 | 263 |
-| `core/varint.py` | 修改 | 新增 `frame_size()` 修复压缩帧切分 | 249 |
+| `core/varint.py` | 修改 | VarInt 编解码 + 压缩帧切分（`read_packet`） | 213 |
 | `core/datatypes.py` | 新增 | 有界读取器（支撑结构探测） | 189 |
 | `core/logger.py` | 修改 | 新增 `set_global_level()` | 71 |
 | `core/__init__.py` | 新增 | 仅存放 `__version__` | 11 |
@@ -774,13 +775,13 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 **2. 压缩帧长度不能用「解压后长度」去比较缓冲区** —— 曾导致每个大区块被丢弃
 - 现象：所有大区块包被误判为「数据不完整」，代理静默丢包。
 - 原因：压缩帧的 `Data Length` 字段是**解压后**长度，不能用来判断压缩数据是否收齐。
-- 避免方法：压缩数据实际长度由外层帧长度界定（`packet_end`）。已修复于 `core/varint.py:186`。
+- 避免方法：压缩数据实际长度由外层帧长度界定（`packet_end`）。已修复于 `core/varint.py:166`。
 - 参考：`core/varint.py` 的 `_read_compressed_packet`
 
 **3. 首次运行会同步下载方块表，阻塞事件循环约 10 秒**
 - 现象：第一个客户端握手时卡住约 10 秒（`urlopen` 是阻塞调用）。
 - 避免方法：生产环境预下载（见 8.3 第 2 步），或 `--no-download` 配合 `--block-map`。
-- 参考：`core/block_registry.py:415`（`download_block_data`）
+- 参考：`core/block_registry.py:407`（`download_block_data`）
 
 **4. 方块注册表**不来自** `Registry Data` 包** —— 容易误解
 - 现象：以为解析了 `Registry Data` 就能得到方块名，结果发现里面没有 `minecraft:block`。
@@ -850,21 +851,24 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 > `spec_validator` 的 104 项断言被**静默跳过**（目录改名后无人更新代码里的
 > 路径）。现按两个候选路径探测，恢复运行且全部通过。
 
-### 死代码清单（2026-10-24 梳理，已定义未使用，暂未删除）
+### 死代码清理记录（2026-10-24 梳理并删除）
 
-| 位置 | 内容 | 说明 |
+以下 7 处「已定义未使用」的代码已删除，删除后 12 套件 665 断言、
+ruff、mypy 全部复验通过：
+
+| 已删除 | 位置（删除前） | 说明 |
 |---|---|---|
-| `core/varint.py:132` | `frame_size()` | 无调用方；压缩帧切分实际由 `read_packet` / `_read_compressed_packet` 完成 |
-| `core/varint.py:236` | `build_packet()` | 无调用方（`proxy.py` 有自己的 `_build_uncompressed_packet`） |
-| `core/protocol.py:138` | `LightData` 数据类 | 无引用；见下一条 |
-| `core/protocol.py:790` | `_on_update_light` | 独立 `Update Light` 包解析后**只打日志**，结果未合并进已存区块（区块包内嵌光照不受影响）。属「做了一半」：解析有了、落盘没有 |
-| `core/protocol.py:134` | `ChunkData.light` 字段 | 恒为 `None`，无人读写 |
-| `core/block_registry.py:368` | `palette_name()` | 无调用方（降级占位逻辑实际在 `chunk_format._build_palette_entry`） |
-| `core/block_registry.py:153/263` | `strict` 构造参数 / `registry.data_version` 赋值 | 只存不用；DataVersion 实际取自 `PROTOCOL_DATA_VERSION` 表 |
+| `frame_size()` | `core/varint.py` | 无调用方；压缩帧切分实际由 `read_packet` / `_read_compressed_packet`（现 `:166`）完成 |
+| `build_packet()` | `core/varint.py` | 无调用方（`proxy.py` 有自己的 `_build_uncompressed_packet`） |
+| `LightData` 数据类 | `core/protocol.py` | 无引用 |
+| `ChunkData.light` 字段 | `core/protocol.py` | 恒为 `None`，无人读写 |
+| `_on_update_light` 处理器 | `core/protocol.py` | 独立 `Update Light` 包解析后只打日志、不落盘；删除后该包照常转发与识别计数，仅不再空解析。注意 `chunk_format.parse_update_light_packet` **保留**——它仍被 `packet_ids.py` 的结构探测使用 |
+| `palette_name()` | `core/block_registry.py` | 无调用方（降级占位逻辑实际在 `chunk_format._build_palette_entry`）；`is_air` 因有测试引用而保留 |
+| `strict` 构造参数 / `registry.data_version` 赋值 | `core/block_registry.py` | 只存不用；DataVersion 实际取自 `PROTOCOL_DATA_VERSION` 表，下载缓存 JSON 里也不再写入无消费者的 `dataVersion` 键 |
 
 ### 性能瓶颈说明
 
-- **瓶颈位置**：`core/block_registry.py:267`（`name_for`）与 `core/chunk_format.py:1253`（`build_chunk_nbt`）
+- **瓶颈位置**：`core/block_registry.py:263`（`name_for`）与 `core/chunk_format.py:1253`（`build_chunk_nbt`）
 - **表现**：每个区块最多 24 节 × 4096 方块 = 98304 次状态查询。实测单区块构建 NBT 5362 字节，压缩后 428 字节；`name_for` 有 20 万条 LRU 缓存，命中后为字典查找。
 - **优化建议**：如需更高吞吐，可将 `build_chunk_nbt` 放入 `asyncio.to_thread` 以释放事件循环（当前为同步调用，会短暂阻塞转发）。
 
@@ -897,7 +901,7 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 
 ### 代码重构建议
 
-- **`protocol.py` 已达 901 行**：建议拆分为 `handlers/` 子包（login/config/play 分组），收益是可读性提升，便于按状态定位处理器。
+- **`protocol.py` 已达 881 行**：建议拆分为 `handlers/` 子包（login/config/play 分组），收益是可读性提升，便于按状态定位处理器。
 - **`chunk_format.py` 达 1389 行**：建议把「解析」与「NBT 构建」分成两个模块，收益是职责单一，测试更聚焦。
 
 ### 技术债务

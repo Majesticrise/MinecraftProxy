@@ -150,8 +150,7 @@ class BlockStateRegistry:
     查询时二分查找定位方块，再按属性顺序计算区间内偏移。
     """
 
-    def __init__(self, strict: bool = True):
-        self.strict = strict
+    def __init__(self):
         # 每项: (min_state_id, max_state_id, name, states_meta)
         self._ranges: list[tuple[int, int, str, list[dict[str, Any]]]] = []
         self._mins: list[int] = []
@@ -258,9 +257,6 @@ class BlockStateRegistry:
         else:
             raise BlockRegistryError(f"无法识别的方块数据格式: {type(data)}")
 
-        # 允许外部数据携带 DataVersion
-        if isinstance(data, dict) and isinstance(data.get("dataVersion"), int):
-            registry.data_version = data["dataVersion"]  # type: ignore[attr-defined]
         return registry
 
     # ------------------------------------------------------------------ 查询
@@ -365,10 +361,6 @@ class BlockStateRegistry:
             return state_id == self.air_state_id
         return state.name in ("minecraft:air", "minecraft:void_air", "minecraft:cave_air")
 
-    def palette_name(self, state_id: int) -> str:
-        """降级模式使用：只区分「空气 / 非空气」"""
-        return "minecraft:air" if self.is_air(state_id) else "minecraft:stone"
-
     # ------------------------------------------------------------------ 诊断
     def describe(self) -> str:
         if not self.loaded:
@@ -428,8 +420,7 @@ def download_block_data(
             data = json.loads(raw.decode("utf-8"))
             if not isinstance(data, list) or not data:
                 continue
-            payload = {"dataVersion": PROTOCOL_DATA_VERSION.get(protocol_version, DEFAULT_DATA_VERSION),
-                       "source": url, "version": ver, "blocks": data}
+            payload = {"source": url, "version": ver, "blocks": data}
             with open(dest, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False)
             logger.info(f"方块数据已缓存: {dest} (版本 {ver})")
