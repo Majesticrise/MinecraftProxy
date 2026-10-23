@@ -1,0 +1,58 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 类型检查 / lint / 测试缓存与覆盖率
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ===== 运行产物 =====
+# 默认世界输出目录
+downloaded_world/
+*.log
+
+# 无论导出到哪个目录，世界文件本体都不进仓库
+*.mca
+*.mcc
+level.dat
+session.lock
+
+# 自动下载的方块数据表（体积较大，首次运行会自动重新下载）
+core/data/blocks_*.json
+
+# 大型二进制（GitHub 单文件上限 100MB，服务端 jar 等一律不入库）
+*.jar
+
+# ===== 本地参考资料（体积大，仅本机使用） =====
+# 真实 1.21.10 服务端与黄金样本世界（Paper jar / libraries / generated reports）
+标准文件/
+你想要的/
+
+# 个人笔记
+请不要下载新的py库.txt
+需要的标准文件.md
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+*.swp
+
+# ===== 操作系统 =====
+Thumbs.db
+Desktop.ini
+.DS_Store

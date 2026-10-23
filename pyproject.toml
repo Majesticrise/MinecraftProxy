@@ -1,0 +1,48 @@
+# 本文件仅用于配置代码质量工具（类型检查 / lint）。
+# 本程序不是一个可安装的 Python 包，直接 `python main.py` 运行即可。
+
+# ---------------------------------------------------------------------------
+# 静态类型检查
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_optional = true
+strict_equality = true
+check_untyped_defs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+show_error_codes = true
+pretty = true
+ignore_missing_imports = true
+exclude = ["^tests/"]
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["__pycache__", "core/data"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",    # 行长由 formatter 处理
+    "B008",    # 允许函数调用作为默认值
+    "SIM105",  # try/except/pass 在异步清理场景下比 contextlib.suppress 更直观
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401", "F841"]  # 测试允许 sys.path 引导后再导入
