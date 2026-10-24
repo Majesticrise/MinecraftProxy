@@ -67,6 +67,7 @@ class MirrorSession:
         self.extractor = ChunkExtractor(server.world_dir, debug=server.debug)
         self.parser.on_chunk_complete = self.extractor.save_chunk
         self.parser.task_tracker = self.extractor.track_write
+        self.parser.on_container_items = self.extractor.update_container_items
 
     # ------------------------------------------------------------------ 运行
     async def run(self) -> None:
@@ -155,6 +156,8 @@ class MirrorSession:
         )
         if meaningful:
             self.extractor.data_version = self.parser.data_version
+            await self.parser.finalize_captures(
+                self.server.world_dir, self.extractor)
             await self.extractor.shutdown()
         else:
             logger.debug("STATUS 探测会话（无区块），不输出统计")

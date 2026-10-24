@@ -17,8 +17,12 @@
 >   javaagent 镜像的明文帧；`agent/` 目录实现 mc-mirror-agent（ByteBuddy
 >   插桩 netty `DefaultChannelPipeline`，抽头锚定 decrypt/decompressor 之后，
 >   add* 钩子自动重定位）。已用 netty 测试桩（`agent/test/run_smoke.py`）
->   验证整条链路（插桩→抽头→重定位→镜像→Python 落盘）。总计 **14 套件 /
->   692 断言**；待实机测试（M3）
+>   验证整条链路（插桩→抽头→重定位→镜像→Python 落盘）。待实机测试（M3）
+> - **附加捕获落地（同日）**：容器内容（打开过的容器写进方块实体，含
+>   「区块已保存后打补丁」路径）、地图画（`data/map_<id>.dat`）、实体快照
+>   （1.13+，`entities/*.mca`）、出生点=退出位置、`--doctor` 自检。新模块：
+>   `containers.py` / `maps.py` / `entities.py` / `data_tables.py` / `tools/doctor.py`；
+>   限制：容器内容暂不支持 1.20.5+（协议 766+）的物品组件格式
 >
 > 自 2.1.0 起新增：多版本支持（1.8.9 / 1.16.5 / 1.17 / 1.18.2）、
 > 区块写入 fsync、写入任务 drain、内存上限、TCP_NODELAY、连接数上限、优雅停机；
@@ -134,7 +138,7 @@ Python >= 3.10          # 实测 3.11.2
 ```
 MinecraftProxy/
 ├── main.py                      # [新增] 程序入口（直接运行，含命令行）
-├── run_tests.py                 # [新增] 统一测试入口（14 套件）
+├── run_tests.py                 # [新增] 统一测试入口（15 套件）
 ├── pyproject.toml               # [新增] 仅 mypy / ruff 配置（无打包配置）
 ├── README.md                    # [新增] 使用说明
 ├── .gitignore                   # [新增] 忽略产物与数据表缓存
@@ -142,6 +146,10 @@ MinecraftProxy/
 │   ├── __init__.py              # 仅存放 __version__（2.4.0）
 │   ├── proxy.py                 # TCP 转发 + 会话生命周期
 │   ├── mirror.py                # [新增] 镜像模式服务端（agent 的明文帧 → 状态机）
+│   ├── containers.py            # [新增] Window Items 解析（三代槽位格式）
+│   ├── maps.py                  # [新增] 地图画累积 + data/map_<id>.dat
+│   ├── entities.py              # [新增] 实体快照状态机 + entities 区域写入
+│   ├── data_tables.py           # [新增] 物品/实体 id->名称（PrismarineJS）
 │   ├── protocol.py              # 状态机 + 区块/注册表/维度处理
 │   ├── packet_ids.py            # 版本自适应包 ID 解析（含 773 / 777 精确表）
 │   ├── chunk_format.py          # 区块包 → Anvil NBT（含自适应 section 布局）
@@ -165,7 +173,7 @@ MinecraftProxy/
 │   │                            # netty-compile.jar（仅编译期，不入 fat jar）
 │   ├── build.bat / build.sh     # 一键构建（产物 mc-mirror-agent.jar 已 gitignore）
 │   └── test/                    # TestHarness.java（netty 测试桩）+ run_smoke.py
-├── tests/                       # [新增] 测试套件（14 个脚本 + audit + 真实抓包固件）
+├── tests/                       # [新增] 测试套件（15 个脚本 + audit + 真实抓包固件）
 │   └── fixtures/                # [新增] 真实服务器抓包固件（ViaVersion 未翻译负载）
 ├── tools/
 │   └── precheck.py              # [新增] 目标服务器预检（协议号 / 可抓取性 / online-mode）
@@ -650,7 +658,7 @@ python -m mypy core main.py tools/precheck.py tests/realdata_test.py
 python -m ruff check .        # 预期：All checks passed!
 
 # 5. 运行测试（含自动下载方块表，首次约 10 秒）
-python run_tests.py           # 预期：全部测试通过（14 套件 / 692 断言）
+python run_tests.py           # 预期：全部测试通过（15 套件 / 744 断言）
 
 # 6. 启动代理（另开一个终端）
 python main.py --target mc.example.com:25565
@@ -695,7 +703,7 @@ dir D:\worlds\prod
 
 ## 9. 测试说明
 
-**测试文件位置**：`tests/`（14 个套件 + `audit.py` + 真实抓包固件；另有 `agent/test/run_smoke.py` 验证 agent 链路，需 JDK）
+**测试文件位置**：`tests/`（15 个套件 + `audit.py` + 真实抓包固件；另有 `agent/test/run_smoke.py` 验证 agent 链路、`tools/doctor.py` 环境自检）
 
 ```
 tests/
@@ -712,6 +720,7 @@ tests/
 ├── biome_test.py            440 行  # 生物群系识别（旧版数字表 / 网络注册表 / 降采样）
 ├── onlinemode_test.py       149 行  # 正版服检测（Encryption Request / agent 安装提示）
 ├── mirror_test.py           214 行  # 镜像模式（协议 / 端到端 / STATUS 静默）
+├── extracapture_test.py     302 行  # 附加捕获（容器 / 地图 / 实体 / 出生点 / doctor）
 ├── spec_validator.py        528 行  # 独立规范校验（自写 NBT 读取器，对照真实世界）
 ├── audit.py                 157 行  # 能力边界审计（对照官方规范）
 └── fixtures/                        # 真实服务器抓包固件（.bin）
@@ -740,7 +749,7 @@ python tools/precheck.py mc.example.com:25565
 python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 ```
 
-**测试覆盖范围**：共 **692 项断言**（含 15 项误判检查），全部通过。
+**测试覆盖范围**：共 **744 项断言**（含 15 项误判检查），全部通过。
 
 | 套件 | 断言数 | 通过 |
 |---|---|---|
@@ -757,6 +766,7 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 | `biome_test.py` | 97 | ✅ 0 失败 |
 | `onlinemode_test.py` | 16 | ✅ 0 失败 |
 | `mirror_test.py` | 11 | ✅ 0 失败 |
+| `extracapture_test.py` | 52 | ✅ 0 失败 |
 | `spec_validator.py` | 104 | ✅ 0 失败 |
 
 > ⚠️ `spec_validator.py` 依赖本地金样本数据：真实 1.21.10 世界与官方
@@ -966,7 +976,7 @@ ruff、mypy 全部复验通过：
 - [ ] **数据库连接正常** — 本项目**无数据库**，确认 `core/data/blocks_773.json`（585 KB）存在
 - [ ] **本地启动成功** — `python main.py --target <离线服> ` 后 `Test-NetConnection -Port 25565` 返回 `TcpTestSucceeded : True`
 - [ ] **接口可访问** — 运行 `python main.py --help`，确认 9 个参数均列出
-- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（14 套件 / 692 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；可选 `python agent/test/run_smoke.py` 验证 agent 链路（需 JDK）
+- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（15 套件 / 744 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；`python main.py --doctor` 自检应输出「环境就绪」
 - [ ] **静态检查通过** — `python -m mypy core main.py tools/precheck.py tests/realdata_test.py` → `Success: no issues found in 17 source files`；`python -m ruff check .` → `All checks passed!`
 - [ ] **文档已阅读理解** — 重点理解第 10 节的 9 个坑点
 - [ ] **已知问题已知晓** — 特别是「在线模式不可用」与「ViaVersion 不翻译区块负载」

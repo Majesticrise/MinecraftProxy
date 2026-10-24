@@ -211,11 +211,13 @@ def write_level_dat(
     world_name: str = "downloaded_world",
     data_version: int = 3955,
     overwrite: bool = False,
+    spawn: tuple[int, int, int] | None = None,
 ) -> bool:
     """
     把 level.dat 写入世界目录（gzip 压缩，与官方一致）。
 
     默认不覆盖已存在的文件，避免破坏用户已经修好的世界。
+    spawn 为玩家最后位置：导出的世界出生在「你退出时的位置」而不是 (0,64,0)。
     """
     path = Path(world_dir) / "level.dat"
     if path.exists() and not overwrite:
@@ -223,10 +225,14 @@ def write_level_dat(
         return True
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        raw = build_level_dat(world_name=world_name, data_version=data_version)
+        spawn_x, spawn_y, spawn_z = spawn if spawn is not None else (0, 64, 0)
+        raw = build_level_dat(
+            world_name=world_name, data_version=data_version,
+            spawn_x=spawn_x, spawn_y=spawn_y, spawn_z=spawn_z,
+        )
         with gzip.open(path, "wb") as fh:
             fh.write(raw)
-        logger.info(f"已生成 level.dat: {path}")
+        logger.info(f"已生成 level.dat: {path}（出生点 {spawn_x},{spawn_y},{spawn_z}）")
         return True
     except Exception as exc:
         logger.error(f"写入 level.dat 失败: {exc}")
@@ -256,8 +262,9 @@ def ensure_world_metadata(
     world_dir: str,
     world_name: str = "downloaded_world",
     data_version: int = 3955,
+    spawn: tuple[int, int, int] | None = None,
 ) -> None:
     """确保世界目录具备 level.dat / session.lock 等最小元数据"""
     Path(world_dir).mkdir(parents=True, exist_ok=True)
-    write_level_dat(world_dir, world_name=world_name, data_version=data_version)
+    write_level_dat(world_dir, world_name=world_name, data_version=data_version, spawn=spawn)
     write_session_lock(world_dir)

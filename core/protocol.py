@@ -38,8 +38,12 @@ from .chunk_format import (
     parse_legacy_map_chunk_bulk_packet,
     parse_unload_chunk_packet,
 )
+from .containers import parse_window_items
+from .data_tables import load_name_map
 from .datatypes import PacketBuffer, write_string, write_varint
+from .entities import EntityTracker, set_current_dimension
 from .logger import setup_logger
+from .maps import MapCollector
 from .packet_ids import (
     DIR_CLIENTBOUND,
     DIR_SERVERBOUND,
@@ -246,6 +250,19 @@ class ProtocolParser:
         self.on_chunk_complete: Callable[[ChunkData, Any], Any] | None = None
         # 任务登记器：用于把区块写入协程托管给提取器，会话结束时统一 drain
         self.task_tracker: Callable[[Any], Any] | None = None
+        # 容器内容回调：(维度, x, y, z, items) -> 协程或 None（由 extractor 提供）
+        self.on_container_items: Callable[[Any, int, int, int, list], Any] | None = None
+
+        # ---- 附加捕获（容器内容 / 地图画 / 实体快照 / 玩家位置）----
+        self.item_names: dict[int, str] | None = None
+        self.entity_names: dict[int, str] | None = None
+        self.map_collector = MapCollector()
+        self.entity_tracker = EntityTracker()
+        # 玩家最后位置（clientbound 同步包 + serverbound 移动包共同维护）
+        self.player_pos: tuple[float, float, float] | None = None
+        # 容器坐标关联：最近的右键/开箱候选 -> Open Screen 分配的窗口
+        self._container_candidate: tuple[int, int, int] | None = None
+        self._window_pos: dict[int, tuple[int, int, int]] = {}
 
         # 握手改写
         self.real_host: str | None = None
@@ -490,6 +507,7 @@ class ProtocolParser:
         """PLAY 状态的 Login 包（Join Game）"""
         self.is_joined = True
         self._try_parse_dimension(payload)
+        set_current_dimension(self.dimension_name)
         logger.info(f"进入 PLAY 状态 (维度: {self.dimension_name})")
 
     _on_login_play = _on_login
@@ -782,6 +800,7 @@ class ProtocolParser:
             self.section_count, self.min_section_y = sections_for_protocol(
                 self.protocol_version, dimension_name
             )
+            set_current_dimension(dimension_name)
             logger.info(f"切换维度: {dimension_name} ({self.section_count} 节)")
         except Exception:
             pass
@@ -840,6 +859,133 @@ class ProtocolParser:
         """
         if self.debug:
             logger.debug(f"配置阶段空负载包（当前状态: {self.state.name}）")
+
+    # ------------------------------------------------------------ 附加捕获
+    def _track(self, coro) -> None:
+        """托管异步回调（与区块写入同一模式，会话结束统一 drain）"""
+        if self.task_tracker is not None:
+            self.task_tracker(coro)
+        else:
+            asyncio.create_task(coro)
+
+    def _items_table(self) -> dict[int, str]:
+        """物品 id -> 名称（首次使用时加载并缓存）"""
+        if self.item_names is None:
+            self.item_names = load_name_map(
+                "items", self.protocol_version, self.world_dir, self.allow_download)
+        return self.item_names
+
+    def _entity_table(self) -> dict[int, str]:
+        """实体类型 id -> 名称（首次使用时加载并缓存）"""
+        if self.entity_names is None:
+            self.entity_names = load_name_map(
+                "entities", self.protocol_version, self.world_dir, self.allow_download)
+        return self.entity_names
+
+    def _on_block_action(self, payload: bytes) -> None:
+        """Block Action：箱子类「打开」动画带坐标（无动画的容器靠右键兜底）"""
+        try:
+            buf = PacketBuffer(payload)
+            x, y, z = buf.read_position()
+            if buf.read_ubyte() == 1:  # action 1 = 打开
+                self._container_candidate = (x, y, z)
+        except Exception:
+            pass
+
+    def _on_use_item_on(self, payload: bytes) -> None:
+        """serverbound Use Item On：玩家右键的方块坐标（容器坐标关联主来源）"""
+        try:
+            buf = PacketBuffer(payload)
+            x, y, z = buf.read_position()
+            self._container_candidate = (x, y, z)
+        except Exception:
+            pass
+
+    def _on_open_window(self, payload: bytes) -> None:
+        """Open Screen / Open Window：把最近的候选坐标绑定到该窗口 id"""
+        try:
+            buf = PacketBuffer(payload)
+            window_id = buf.read_varint()  # UByte 与 VarInt 单字节编码等价
+            if self._container_candidate is not None:
+                self._window_pos[window_id] = self._container_candidate
+                self._container_candidate = None
+        except Exception:
+            pass
+
+    _on_open_screen = _on_open_window
+
+    def _on_window_items(self, payload: bytes) -> None:
+        """Window Items：打开过的容器内容 -> extractor 合并进方块实体"""
+        content = parse_window_items(payload, self.protocol_version, self._items_table())
+        if content is None:
+            return
+        pos = self._window_pos.pop(content.window_id, None)
+        if pos is None or not content.items:
+            return
+        x, y, z = pos
+        logger.debug(f"容器内容: ({x},{y},{z}) {len(content.items)} 组物品")
+        if self.on_container_items is not None:
+            try:
+                result = self.on_container_items(
+                    self.dimension_name, x, y, z, content.items)
+                if asyncio.iscoroutine(result):
+                    self._track(result)
+            except Exception:
+                logger.exception("容器内容合并失败")
+
+    def _on_map(self, payload: bytes) -> None:
+        """Map Data：地图画的增量色板"""
+        self.map_collector.on_map_data(payload)
+
+    def _on_spawn_entity(self, payload: bytes) -> None:
+        self.entity_tracker.on_spawn_entity(payload, self._entity_table())
+
+    def _on_spawn_player(self, payload: bytes) -> None:
+        self.entity_tracker.on_spawn_player(payload)
+
+    def _on_entity_destroy(self, payload: bytes) -> None:
+        self.entity_tracker.on_destroy_entities(payload)
+
+    def _on_entity_teleport(self, payload: bytes) -> None:
+        self.entity_tracker.on_entity_teleport(payload, self.protocol_version)
+
+    def _on_position(self, payload: bytes) -> None:
+        """
+        玩家位置：clientbound 的 Position / Synchronize Player Position
+        与 serverbound 的 Position / Position Look / Set Player Position 等
+        载荷都以 3 个 Double 开头，一个处理器通吃。
+        """
+        try:
+            buf = PacketBuffer(payload)
+            self.player_pos = (buf.read_double(), buf.read_double(), buf.read_double())
+        except Exception:
+            pass
+
+    _on_position_look = _on_position
+    _on_set_player_position = _on_position
+    _on_set_player_position_and_rotation = _on_position
+    _on_synchronize_player_position = _on_position
+
+    async def finalize_captures(self, world_dir: str, extractor) -> None:
+        """
+        会话收尾（在 extractor.shutdown 之前调用）：
+        地图画写 data/map_*.dat、实体快照写 entities/*.mca、
+        玩家最后位置 -> level.dat 出生点。
+        """
+        try:
+            self.map_collector.write_maps(world_dir, self.data_version,
+                                          self.dimension_name)
+        except Exception as exc:
+            logger.error(f"地图数据写盘失败: {exc}")
+        if self.entity_tracker.count:
+            try:
+                await self.entity_tracker.flush(
+                    world_dir, self.data_version, extractor.save_entity_chunk)
+            except Exception as exc:
+                logger.error(f"实体快照写盘失败: {exc}")
+        if self.player_pos is not None:
+            extractor.spawn = (
+                int(self.player_pos[0]), int(self.player_pos[1]), int(self.player_pos[2]))
 
     # ------------------------------------------------------------ 区块输出
     def _emit_chunk(self, parsed: ParsedChunk) -> None:

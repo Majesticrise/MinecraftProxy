@@ -308,6 +308,8 @@ class ClientSession:
         self.protocol_parser.on_chunk_complete = self.chunk_extractor.save_chunk
         # 让区块写入协程被提取器托管，会话结束前统一 drain（防丢数据）
         self.protocol_parser.task_tracker = self.chunk_extractor.track_write
+        # 容器内容（打开过的箱子等）合并进方块实体
+        self.protocol_parser.on_container_items = self.chunk_extractor.update_container_items
 
         downstream = asyncio.create_task(self.handle_downstream(), name="downstream")
         upstream = asyncio.create_task(self.handle_upstream(), name="upstream")
@@ -331,8 +333,11 @@ class ClientSession:
                     task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
             try:
-                # 会话可能随时被外部打断：先把在途的区块写入跑完再生成 level.dat
+                # 会话可能随时被外部打断：先把在途的区块写入跑完，
+                # 再落盘地图/实体等附加捕获，最后生成 level.dat
                 self.chunk_extractor.data_version = self.protocol_parser.data_version
+                await self.protocol_parser.finalize_captures(
+                    self.world_dir, self.chunk_extractor)
                 await self.chunk_extractor.shutdown()
             except Exception as exc:
                 logger.error(f"区块提取器收尾失败: {exc}", exc_info=True)

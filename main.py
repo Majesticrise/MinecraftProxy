@@ -102,6 +102,11 @@ def build_parser():
              "（用于正版验证服务器；开启后无需 --target）",
     )
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="一键自检（环境/数据表/端口/agent），检查完退出",
+    )
+    parser.add_argument(
         "--no-prompt",
         action="store_true",
         help="不进行交互式提问（缺少参数时直接报错，适合脚本调用）",
@@ -238,6 +243,15 @@ async def run(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     no_prompt = args.no_prompt
+
+    if args.doctor:
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "tools", "doctor.py")]
+            + (["--smoke"] if args.debug else []),
+        )
+        return result.returncode
 
     if args.mirror_port:
         return await _run_mirror(args)

@@ -12,12 +12,15 @@ import json
 import os
 import struct
 import time
+import zlib
 from collections import deque
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
 
+from . import nbt
+from .containers import container_entity_id
 from .logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -125,13 +128,53 @@ class AnvilWriter:
         self.stats = RegionStats()
 
     # ------------------------------------------------------------------ 路径
-    def _get_region_dir(self, dimension: Any) -> Path:
-        return self.world_dir / dimension_dir_name(dimension) / "region"
+    def _get_region_dir(self, dimension: Any, subdir: str = "region") -> Path:
+        return self.world_dir / dimension_dir_name(dimension) / subdir
 
-    def _get_region_path(self, chunk_x: int, chunk_z: int, dimension: Any) -> Path:
-        region_dir = self._get_region_dir(dimension)
+    def _get_region_path(self, chunk_x: int, chunk_z: int, dimension: Any,
+                         subdir: str = "region") -> Path:
+        region_dir = self._get_region_dir(dimension, subdir)
         region_dir.mkdir(parents=True, exist_ok=True)
         return region_dir / f"r.{chunk_x >> 5}.{chunk_z >> 5}.mca"
+
+    # -------------------------------------------------------------- 区块读取
+    async def read_chunk(self, chunk_x: int, chunk_z: int, dimension: Any = 0,
+                         subdir: str = "region") -> bytes | None:
+        """读回一个已保存的区块，返回解压后的 NBT 字节（不存在返回 None）。
+
+        用于「容器内容事后到达」的补丁路径：区块先落盘、玩家之后才打开箱子。
+        """
+        region_file = self._get_region_path(chunk_x, chunk_z, dimension, subdir)
+        index = (chunk_x & 31) + (chunk_z & 31) * 32
+        async with self.lock:
+            return await asyncio.to_thread(self._read_chunk_sync, region_file, index)
+
+    def _read_chunk_sync(self, region_file: Path, index: int) -> bytes | None:
+        try:
+            if not region_file.exists():
+                return None
+            with open(region_file, "rb") as fh:
+                raw = fh.read(HEADER_SIZE)
+                if len(raw) < HEADER_SIZE:
+                    return None
+                entry = struct.unpack_from(">I", raw, index * 4)[0]
+                offset, count = entry >> 8, entry & 0xFF
+                if offset < 2 or count == 0:
+                    return None
+                fh.seek(offset * SECTOR_SIZE)
+                length = struct.unpack(">I", fh.read(4))[0]
+                ctype = fh.read(1)[0]
+                data = fh.read(max(0, length - 1))
+            if ctype == self.COMPRESSION_ZLIB:
+                return zlib.decompress(data)
+            if ctype == 1:
+                import gzip
+                return gzip.decompress(data)
+            if ctype == 3:
+                return data
+            return None
+        except Exception:
+            return None
 
     # ------------------------------------------------------------ 扇区数据
     @staticmethod
@@ -235,6 +278,7 @@ class AnvilWriter:
         chunk_z: int,
         compressed_nbt: bytes,
         dimension: Any = 0,
+        subdir: str = "region",
     ) -> bool:
         """把（已 zlib 压缩的）区块 NBT 写入区域文件"""
         if not compressed_nbt:
@@ -249,10 +293,10 @@ class AnvilWriter:
         # 超过 255 扇区（约 1020 KiB）时必须外置为 c.x.z.mcc
         if sector_count > SECTORS_PER_CHUNK_MAX:
             return await self._save_external_chunk(
-                chunk_x, chunk_z, compressed_nbt, dimension
+                chunk_x, chunk_z, compressed_nbt, dimension, subdir
             )
 
-        region_file = self._get_region_path(chunk_x, chunk_z, dimension)
+        region_file = self._get_region_path(chunk_x, chunk_z, dimension, subdir)
         local_x = chunk_x & 31
         local_z = chunk_z & 31
 
@@ -341,7 +385,8 @@ class AnvilWriter:
         chunk_x: int,
         chunk_z: int,
         compressed_nbt: bytes,
-        dimension: Any,
+        dimension: Any = 0,
+        subdir: str = "region",
     ) -> bool:
         """
         超大区块外置存储。
@@ -349,9 +394,9 @@ class AnvilWriter:
         官方规定：当压缩数据超过 255 扇区时，把数据写入 `c.<x>.<z>.mcc`，
         并在区域文件的位置表里写入「压缩类型 | 128」和 length = 1。
         """
-        region_dir = self._get_region_dir(dimension)
+        region_dir = self._get_region_dir(dimension, subdir)
         external = region_dir / f"c.{chunk_x}.{chunk_z}.mcc"
-        region_file = self._get_region_path(chunk_x, chunk_z, dimension)
+        region_file = self._get_region_path(chunk_x, chunk_z, dimension, subdir)
         local_x = chunk_x & 31
         local_z = chunk_z & 31
         index = local_x + local_z * 32
@@ -457,6 +502,15 @@ class ChunkExtractor:
         self._pending_writes: set[asyncio.Task] = set()
         # 写入区块 NBT 的 DataVersion（影响游戏如何做数据升级）
         self.data_version: int = 3955
+        # 玩家最后位置（写入 level.dat 出生点；None 用默认）
+        self.spawn: tuple[int, int, int] | None = None
+        # 已捕获的容器数量（统计展示用）
+        self.containers_captured: int = 0
+        # 事后到达的容器内容：(维度, x, y, z) -> Items NBT 列表。
+        # 区块先落盘、玩家之后才开箱是常态，两条路径都要支持：
+        #   区块未保存 -> 暂存，save_chunk 时合并进区块 NBT
+        #   区块已保存 -> read_chunk 读回、打补丁、重写
+        self._pending_containers: dict[tuple[Any, int, int, int], list] = {}
 
     # ------------------------------------------------------------------ 保存
     async def save_chunk(self, chunk_data, dimension: Any = 0) -> bool:
@@ -487,6 +541,10 @@ class ChunkExtractor:
         if not nbt_data:
             self.stats["chunks_failed"] += 1
             return False
+
+        # 区块落盘前，合并「先开箱、后到区块」暂存的容器内容
+        if self._pending_containers:
+            nbt_data = self._apply_pending_containers(dimension, chunk_x, chunk_z, nbt_data)
 
         success = await self.anvil_writer.save_chunk(chunk_x, chunk_z, nbt_data, dimension)
         if not success:
@@ -532,6 +590,74 @@ class ChunkExtractor:
             for result in results:
                 if isinstance(result, Exception):
                     logger.debug(f"写入任务异常: {result}")
+
+    # ------------------------------------------------------------ 容器内容
+    async def update_container_items(
+        self, dimension: Any, x: int, y: int, z: int, items: list
+    ) -> bool:
+        """把打开过的容器内容合并进 (x,y,z) 处方块实体的 Items。"""
+        chunk_key = (dimension, x >> 4, z >> 4)
+        if chunk_key in self._saved_keys:
+            return await self._patch_saved_chunk(dimension, x, y, z, items)
+        # 区块还没到：暂存，等该区块落盘时合并（计数在真正合并时进行）
+        self._pending_containers[(dimension, x, y, z)] = items
+        return True
+
+    async def _patch_saved_chunk(
+        self, dimension: Any, x: int, y: int, z: int, items: list
+    ) -> bool:
+        raw = await self.anvil_writer.read_chunk(x >> 4, z >> 4, dimension)
+        if raw is None:
+            # 区块记录读不回（理论不应发生）：退回暂存，等区块重发
+            self._pending_containers[(dimension, x, y, z)] = items
+            return False
+        try:
+            root, _end = nbt.parse_named_tag(raw, 0)
+        except Exception:
+            return False
+        if not isinstance(root, dict) or not _merge_items_into_root(root, x, y, z, items):
+            return False
+        compressed = zlib.compress(nbt.build_root(root, ""), 6)
+        ok = await self.anvil_writer.save_chunk(x >> 4, z >> 4, compressed, dimension)
+        if ok:
+            self.containers_captured += 1
+        return ok
+
+    def _apply_pending_containers(
+        self, dimension: Any, chunk_x: int, chunk_z: int, compressed: bytes
+    ) -> bytes:
+        matching = [
+            key for key in self._pending_containers
+            if key[0] == dimension and (key[1] >> 4) == chunk_x and (key[3] >> 4) == chunk_z
+        ]
+        if not matching:
+            return compressed
+        try:
+            root, _end = nbt.parse_named_tag(zlib.decompress(compressed), 0)
+            if not isinstance(root, dict):
+                return compressed
+            changed = False
+            for key in matching:
+                _, x, y, z = key
+                items = self._pending_containers.pop(key)
+                if _merge_items_into_root(root, x, y, z, items):
+                    changed = True
+                    self.containers_captured += 1
+            if not changed:
+                return compressed
+            return zlib.compress(nbt.build_root(root, ""), 6)
+        except Exception as exc:
+            logger.debug(f"合并容器内容失败 ({chunk_x},{chunk_z}): {exc}")
+            return compressed
+
+    async def save_entity_chunk(
+        self, compressed_nbt: bytes, chunk_x: int, chunk_z: int, dimension: Any = 0
+    ) -> bool:
+        """写入 entities/ 区域文件（实体快照，1.17+ 独立目录）"""
+        if not compressed_nbt:
+            return False
+        return await self.anvil_writer.save_chunk(
+            chunk_x, chunk_z, compressed_nbt, dimension, subdir="entities")
 
     # ------------------------------------------------------------ 方块实体
     async def _save_block_entities(
@@ -604,12 +730,87 @@ class ChunkExtractor:
             + (f", 外置={external}" if external else "")
         )
 
-        # 生成 level.dat，让输出目录成为可加载的世界
+        # 生成 level.dat，让输出目录成为可加载的世界（出生点用玩家最后位置）
         if saved > 0:
             from .level_dat import ensure_world_metadata
             ensure_world_metadata(
                 str(self.world_dir),
                 world_name=self.world_dir.name or "downloaded_world",
                 data_version=self.data_version,
+                spawn=self.spawn,
             )
+        if self.containers_captured:
+            logger.info(f"容器内容: 已合并 {self.containers_captured} 个")
         logger.info("区块提取器已关闭")
+
+
+# --------------------------------------------------------------------------
+# 容器内容合并的辅助（操作对象是已构建/已保存的区块 NBT 根字典）
+# --------------------------------------------------------------------------
+def _merge_items_into_root(root: dict, x: int, y: int, z: int, items: list) -> bool:
+    """把 Items 合并进 (x,y,z) 的方块实体；实体不存在时按方块名补建。"""
+    entities_list = root.get("block_entities")
+    if not isinstance(entities_list, nbt.List):
+        return False
+    # 1) 已有该坐标的方块实体 -> 直接更新 Items
+    for entry in entities_list:
+        try:
+            if (int(entry.get("x", 1 << 60)) == x
+                    and int(entry.get("y", 1 << 60)) == y
+                    and int(entry.get("z", 1 << 60)) == z):
+                entry["Items"] = nbt.List(nbt.TAG_COMPOUND, items)
+                return True
+        except Exception:
+            continue
+    # 2) 不存在 -> 从区块数据反查方块名，确认是容器才补建
+    block_name = _block_name_at(root, x, y, z)
+    be_id = container_entity_id(block_name)
+    if not be_id:
+        logger.debug(f"({x},{y},{z}) 不是容器方块（{block_name}），忽略容器内容")
+        return False
+    entities_list.append(nbt.compound({
+        "id": nbt.String(be_id),
+        "x": nbt.Int(x),
+        "y": nbt.Int(y),
+        "z": nbt.Int(z),
+        "keep": nbt.Byte(1),
+        "Items": nbt.List(nbt.TAG_COMPOUND, items),
+    }))
+    return True
+
+
+def _block_name_at(root: dict, x: int, y: int, z: int) -> str | None:
+    """从区块 NBT 里读世界坐标 (x,y,z) 处的方块资源名（调色板 + 位打包还原）"""
+    try:
+        sections = root.get("sections")
+        if not sections:
+            return None
+        y_sec = y >> 4
+        for section in sections:
+            if int(section.get("Y", 999)) != y_sec:
+                continue
+            states = section.get("block_states")
+            if not isinstance(states, dict):
+                return None
+            palette = states.get("palette")
+            if not palette:
+                return None
+            if len(palette) == 1:
+                return str(palette[0].get("Name", ""))
+            data = states.get("data")
+            if not data:
+                return None
+            bits = max(4, (len(palette) - 1).bit_length())
+            index = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)  # YZX
+            per_long = 64 // bits
+            long_index = index // per_long
+            bit_offset = (index % per_long) * bits
+            if long_index >= len(data):
+                return None
+            value = (int(data[long_index]) >> bit_offset) & ((1 << bits) - 1)
+            if value >= len(palette):
+                return None
+            return str(palette[value].get("Name", ""))
+    except Exception:
+        return None
+    return None

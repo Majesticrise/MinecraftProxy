@@ -650,7 +650,59 @@ def detect_play_clientbound(payload: bytes) -> str | None:
         return "Block Entity Data"
     if _detect_play_join_game(payload):
         return "Login (play)"
+    if _detect_spawn_entity(payload):
+        return "Spawn Entity"
+    if _detect_map_data(payload):
+        return "Map"
+    if _detect_window_items(payload):
+        return "Window Items"
     return None
+
+
+def _detect_spawn_entity(payload: bytes) -> bool:
+    """
+    Spawn Entity（1.13+）: VarInt eid + UUID(16) + VarInt type + 3×Double
+    + 2×UByte(朝向) + UByte(头部) + VarInt(data) + 3×Short(速度)，无剩余。
+    形状足够独特，可作为结构探测（错误识别会污染缓存，条件从严）。
+    """
+    if len(payload) < 40:
+        return False
+    try:
+        buf = PacketBuffer(payload)
+        if buf.read_varint() <= 0:
+            return False
+        buf.read(16)
+        if not (0 <= buf.read_varint() <= 4096):
+            return False
+        for _ in range(3):
+            if abs(buf.read_double()) > 3.0e7:
+                return False
+        buf.read(3)
+        buf.read_varint()
+        buf.read_short()
+        buf.read_short()
+        buf.read_short()
+        return buf.at_end()
+    except Exception:
+        return False
+
+
+def _detect_map_data(payload: bytes) -> bool:
+    """Map Data：交给 MapCollector 的严格解析器判断（必须精确消费全部字节）"""
+    from .maps import MapCollector
+    try:
+        return MapCollector().on_map_data(payload)
+    except Exception:
+        return False
+
+
+def _detect_window_items(payload: bytes) -> bool:
+    """Window Items：交给 containers 的严格解析器判断（版本未知时多格式试探）"""
+    from .containers import parse_window_items
+    try:
+        return parse_window_items(payload, None, {}) is not None
+    except Exception:
+        return False
 
 
 def detect_play_serverbound(payload: bytes) -> str | None:

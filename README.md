@@ -11,8 +11,12 @@ Minecraft Java 版协议代理：在客户端与服务器之间做**字节透明
 |---|---|
 | **字节透明** | 只解析数据副本，转发永远是原始字节切片；不会破坏压缩帧 |
 | **版本自适应** | 从握手包读 `protocol_version`，精确 ID 表 → 结构探测，**不硬编码包 ID** |
-| **可加载的世界** | 方块状态 ID → 真实方块名（`Name` + `Properties`），并生成 `level.dat` |
+| **可加载的世界** | 方块状态 ID → 真实方块名（`Name` + `Properties`），并生成 `level.dat`（出生点 = 退出位置） |
 | **真实生物群系** | 1.8 数字表 / 1.16 Registry Codec / 1.18+ `Registry Data` 动态注册表，逐版本识别 |
+| **容器内容** | **打开过的**箱子/木桶/潜影盒/熔炉等，内容直接写进导出世界的方块实体（协议限制：服务器只在你打开时才下发内容） |
+| **地图画** | `Map Data` 包累积 128×128 色板，导出为 `data/map_<id>.dat`（用 `/give @s filled_map[minecraft:map_id=<id>]` 取出查看） |
+| **实体快照** | 怪物/动物/矿车/掉落物/展示框（仅 1.13+）：类型 + 坐标 + 朝向 + UUID，写入 1.17+ 的 `entities/` 区域文件（装备/血量等元数据暂不采集） |
+| **一键自检** | `python main.py --doctor`：Python / 数据表 / 端口 / JDK / agent 逐项检查，问题截图即可求助 |
 | **动态世界高度** | 主世界 24 节 / 下界末地 16 节 / 模组可更多，自动适配 |
 | **多维度** | 主世界、下界、末地、以及模组自定义维度各自独立目录 |
 | **多玩家安全** | 进程级共享锁，并发写同一区域文件不会损坏 |
@@ -216,6 +220,9 @@ python main.py --target mc.example.com --block-map ./blocks.json
 # 镜像模式（正版验证服务器，需 mc-mirror-agent，见下文）
 python main.py --mirror-port 25566 --world-dir ./downloaded_world
 
+# 一键自检（环境 / 数据表 / 端口 / JDK / agent）
+python main.py --doctor
+
 # 调试日志
 python main.py --target mc.example.com --debug
 ```
@@ -326,7 +333,7 @@ python run_tests.py selftest       # 单个套件（子串匹配）
 python tests/audit.py              # 能力边界审计
 ```
 
-当前 14 个套件共 692 条断言，全部通过：
+当前 15 个套件共 744 条断言，全部通过：
 
 | 套件 | 断言数 | 覆盖 |
 |---|---|---|
@@ -343,6 +350,7 @@ python tests/audit.py              # 能力边界审计
 | `biome_test.py` | 97 | **生物群系识别**（1.8 / 1.16 数字表 / 1.18+ 网络注册表 / 降采样 / 归一化） |
 | `onlinemode_test.py` | 16 | **正版服检测**（Encryption Request 探测 / 精确表别名 / agent 安装提示 / 镜像模式不告警） |
 | `mirror_test.py` | 11 | **镜像模式**（协议 magic / 登录链端到端 / 真实固件落盘 / STATUS 静默） |
+| `extracapture_test.py` | 52 | **附加捕获**（容器三格式解析与两条合并路径 / 地图色板索引 / 实体 NBT 逐项 / 出生点 / doctor） |
 | `spec_validator.py` | 104 | **独立**规范校验（自写 NBT 读取器，对照真实 1.21.10 世界） |
 
 > 注：`spec_validator.py` 依赖本地金样本数据（真实 1.21.10 世界 + 官方
@@ -369,6 +377,13 @@ ruff check .
   本程序会自适应反推真实 section 布局并校正世界高度，实测（1.21.10 客户端 + ViaFabric
   连 1.8.9 服务器）已能正确抓取。若遇到解析失败，`--debug` 会打印
   `区块包解析失败 (协议 …, 家族 …, 节数 …)` 便于定位。
+- **容器内容只覆盖「打开过的」容器**：服务器只在你打开时才下发内容（协议设计），
+  站在箱子旁边不会下载里面的东西；1.20.5+（协议 766+）的物品组件格式暂不支持，
+  即容器内容捕获当前覆盖 1.8 ~ 1.20.4（精确表版本 + 结构探测）
+- **实体是「看到过的快照」**：类型/坐标/朝向/UUID（1.13+），装备、生物血量、
+  展示框内物品等元数据暂不采集；已离开视野的实体若未收到销毁包会留在快照里
+- **地图画需要对应 mod/指令取出查看**：导出的 `data/map_<id>.dat` 可用
+  `/give @s filled_map[minecraft:map_id=<id>]`（1.20.5+）取出
 - **生物群系已真实识别**（不再是占位值）：
   - **1.18+**：从配置阶段的 `Registry Data`（`minecraft:worldgen/biome`）读取，
     **列表顺序即 ID**（支持模组服的上百项动态注册表）
