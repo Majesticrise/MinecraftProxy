@@ -25,6 +25,8 @@ SUITES = [
     ("健壮性回归测试（负数 VarInt / 落盘 / 内存上限 / 网络）", "robustness_test.py"),
     ("真实数据回归（ViaVersion 未翻译区块负载 / 1.21.9 精确表）", "realdata_test.py"),
     ("生物群系识别（1.8 / 1.16 数字表 / 1.18+ 网络注册表 / 降采样）", "biome_test.py"),
+    ("正版服检测（Encryption Request 识别 / 提示安装 agent）", "onlinemode_test.py"),
+    ("镜像模式（mc-mirror-agent 协议 / 端到端 / STATUS 静默）", "mirror_test.py"),
     ("独立规范校验（对照真实 1.21.10 世界，不依赖项目代码）", "spec_validator.py"),
 ]
 

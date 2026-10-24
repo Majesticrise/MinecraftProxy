@@ -202,6 +202,7 @@ class ProtocolParser:
         world_dir: str = ".",
         block_map: str | None = None,
         allow_download: bool = True,
+        mirror_mode: bool = False,
     ):
         self.debug = debug
         self.state = ConnectionState.HANDSHAKE
@@ -210,6 +211,10 @@ class ProtocolParser:
         self.dimension_name: str = "minecraft:overworld"
         self.is_joined = False
         self.compression_threshold: int = -1
+        # 镜像模式（mc-mirror-agent 旁路）：输入是客户端进程内解密后的明文帧，
+        # 加密流不影响解析，因此检测到加密时只记信息日志而非提示安装 agent
+        self.mirror_mode = mirror_mode
+        self._online_mode_reported = False
 
         # 版本自适应
         self.protocol_version: int | None = None
@@ -436,6 +441,32 @@ class ProtocolParser:
             return
         self.compression_threshold = threshold
         logger.info(f"服务器设置压缩阈值: {threshold}")
+
+    def _on_encryption_request(self, payload: bytes) -> None:
+        """
+        服务器要求加密 —— 正版验证（online-mode=true）的标志。
+
+        * 代理模式（默认）：字节转发不受影响、游戏可正常玩，但后续流量为
+          AES 密文，无法旁路解析区块。这里**明确提示**而不是默默无区块，
+          指引用户安装 mc-mirror-agent 走镜像模式（离线验证服无需 agent）。
+        * 镜像模式：加密由客户端原有 handler 完成，镜像的是解密后的明文，
+          一切正常，只记一条信息日志。
+        """
+        if self._online_mode_reported:
+            return
+        self._online_mode_reported = True
+        if self.mirror_mode:
+            logger.info("服务器要求加密（正版验证）；镜像模式下不受影响，继续抓取")
+            return
+        logger.warning("检测到正版验证服务器（online-mode=true）：服务器发送了 Encryption Request")
+        logger.warning("后续流量为 AES 加密，字节代理无法解析区块；转发不受影响，游戏仍可正常进行")
+        logger.warning(
+            "抓取正版服需要安装 mc-mirror-agent（镜像模式），"
+            "详见 README 的「正版验证服务器」章节"
+        )
+
+    # 773+ 精确表中该包名为 "Encryption Begin"，指向同一处理器
+    _on_encryption_begin = _on_encryption_request
 
     def _on_login_success(self, payload: bytes) -> None:
         """Login Success: UUID(16) + String name + Prefixed Array of properties + Optional Session ID"""

@@ -1,6 +1,6 @@
 # HANDOFF_MinecraftProxy_20261010
 
-> ✅ **本文档已更新至 2026-10-24（对应版本 2.4.0）**，与当前代码一致。
+> ✅ **本文档已更新至 2026-10-24（对应版本 2.5.0：新增镜像模式 + mc-mirror-agent）**，与当前代码一致。
 >
 > 自 2026-10-24 起的修订（文档与代码重新对齐）：
 > - **修复 `spec_validator` 金样本路径**：金样本目录由 `你想要的/` 改名为
@@ -10,6 +10,15 @@
 >   测试实为 **665** 断言（含 15 项误判检查）——旧文档写的 587 与分项表加和不符
 > - 梳理出 **7 处已定义未使用的代码并于同日删除**（见第 10 节「死代码清理记录」），
 >   删除后 12 套件 665 断言、ruff、mypy 全部复验通过
+> - 新增**正版服检测**：代理模式识别 `Encryption Request`（精确表 +
+>   结构探测，任意版本可用）后**明确提示安装 mc-mirror-agent**，离线服
+>   零依赖不受影响；镜像模式只记信息日志。新增套件 `onlinemode_test.py`
+> - **镜像模式（M1+M2）落地**：`core/mirror.py` + `--mirror-port` 接收
+>   javaagent 镜像的明文帧；`agent/` 目录实现 mc-mirror-agent（ByteBuddy
+>   插桩 netty `DefaultChannelPipeline`，抽头锚定 decrypt/decompressor 之后，
+>   add* 钩子自动重定位）。已用 netty 测试桩（`agent/test/run_smoke.py`）
+>   验证整条链路（插桩→抽头→重定位→镜像→Python 落盘）。总计 **14 套件 /
+>   692 断言**；待实机测试（M3）
 >
 > 自 2.1.0 起新增：多版本支持（1.8.9 / 1.16.5 / 1.17 / 1.18.2）、
 > 区块写入 fsync、写入任务 drain、内存上限、TCP_NODELAY、连接数上限、优雅停机；
@@ -65,7 +74,7 @@
 | 项目 | 值 |
 |---|---|
 | **项目名称** | MinecraftProxy（独立程序，内部模块在 `core/`） |
-| **版本** | 2.4.0 |
+| **版本** | 2.5.0 |
 | **开发时间** | 2026-10-10 20:58 ~ 2026-10-11 |
 | **负责 AI/开发者** | GitHub Copilot（DeepSeek V4.1 Flash） |
 | **代码位置** | `d:\yx\attack\mcserverfinder\MinecraftProxy` |
@@ -125,13 +134,14 @@ Python >= 3.10          # 实测 3.11.2
 ```
 MinecraftProxy/
 ├── main.py                      # [新增] 程序入口（直接运行，含命令行）
-├── run_tests.py                 # [新增] 统一测试入口（12 套件）
+├── run_tests.py                 # [新增] 统一测试入口（14 套件）
 ├── pyproject.toml               # [新增] 仅 mypy / ruff 配置（无打包配置）
 ├── README.md                    # [新增] 使用说明
 ├── .gitignore                   # [新增] 忽略产物与数据表缓存
 ├── core/                        # [新增] 程序内部模块（非对外库）
 │   ├── __init__.py              # 仅存放 __version__（2.4.0）
 │   ├── proxy.py                 # TCP 转发 + 会话生命周期
+│   ├── mirror.py                # [新增] 镜像模式服务端（agent 的明文帧 → 状态机）
 │   ├── protocol.py              # 状态机 + 区块/注册表/维度处理
 │   ├── packet_ids.py            # 版本自适应包 ID 解析（含 773 / 777 精确表）
 │   ├── chunk_format.py          # 区块包 → Anvil NBT（含自适应 section 布局）
@@ -148,7 +158,14 @@ MinecraftProxy/
 │       ├── blocks_770.json      # 542 KB（1.21.5）
 │       ├── blocks_773.json      # 585 KB（1.21.9）
 │       └── blocks_777.json      # 542 KB（26.3）
-├── tests/                       # [新增] 测试套件（12 个脚本 + audit + 真实抓包固件）
+├── agent/                       # [新增] mc-mirror-agent（正版服镜像模式 javaagent）
+│   ├── src/mcproxy/             # 616 行 Java：premain / ByteBuddy 插桩 /
+│   │                            # 管道抽头与锚点重定位 / 镜像客户端
+│   ├── lib/                     # byte-buddy.jar（打进 fat jar）
+│   │                            # netty-compile.jar（仅编译期，不入 fat jar）
+│   ├── build.bat / build.sh     # 一键构建（产物 mc-mirror-agent.jar 已 gitignore）
+│   └── test/                    # TestHarness.java（netty 测试桩）+ run_smoke.py
+├── tests/                       # [新增] 测试套件（14 个脚本 + audit + 真实抓包固件）
 │   └── fixtures/                # [新增] 真实服务器抓包固件（ViaVersion 未翻译负载）
 ├── tools/
 │   └── precheck.py              # [新增] 目标服务器预检（协议号 / 可抓取性 / online-mode）
@@ -633,7 +650,7 @@ python -m mypy core main.py tools/precheck.py tests/realdata_test.py
 python -m ruff check .        # 预期：All checks passed!
 
 # 5. 运行测试（含自动下载方块表，首次约 10 秒）
-python run_tests.py           # 预期：全部测试通过（12 套件 / 665 断言）
+python run_tests.py           # 预期：全部测试通过（14 套件 / 692 断言）
 
 # 6. 启动代理（另开一个终端）
 python main.py --target mc.example.com:25565
@@ -678,7 +695,7 @@ dir D:\worlds\prod
 
 ## 9. 测试说明
 
-**测试文件位置**：`tests/`（12 个套件 + `audit.py` + 真实抓包固件）
+**测试文件位置**：`tests/`（14 个套件 + `audit.py` + 真实抓包固件；另有 `agent/test/run_smoke.py` 验证 agent 链路，需 JDK）
 
 ```
 tests/
@@ -693,6 +710,8 @@ tests/
 ├── robustness_test.py       612 行  # 健壮性（负数 VarInt / 落盘 / 内存 / 会话终止）
 ├── realdata_test.py         192 行  # 真实抓包回归（ViaVersion 未翻译负载）
 ├── biome_test.py            440 行  # 生物群系识别（旧版数字表 / 网络注册表 / 降采样）
+├── onlinemode_test.py       149 行  # 正版服检测（Encryption Request / agent 安装提示）
+├── mirror_test.py           214 行  # 镜像模式（协议 / 端到端 / STATUS 静默）
 ├── spec_validator.py        528 行  # 独立规范校验（自写 NBT 读取器，对照真实世界）
 ├── audit.py                 157 行  # 能力边界审计（对照官方规范）
 └── fixtures/                        # 真实服务器抓包固件（.bin）
@@ -721,7 +740,7 @@ python tools/precheck.py mc.example.com:25565
 python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 ```
 
-**测试覆盖范围**：共 **665 项断言**（含 15 项误判检查），全部通过。
+**测试覆盖范围**：共 **692 项断言**（含 15 项误判检查），全部通过。
 
 | 套件 | 断言数 | 通过 |
 |---|---|---|
@@ -736,6 +755,8 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 | `robustness_test.py` | 70 | ✅ 0 失败 |
 | `realdata_test.py` | 56 | ✅ 0 失败 |
 | `biome_test.py` | 97 | ✅ 0 失败 |
+| `onlinemode_test.py` | 16 | ✅ 0 失败 |
+| `mirror_test.py` | 11 | ✅ 0 失败 |
 | `spec_validator.py` | 104 | ✅ 0 失败 |
 
 > ⚠️ `spec_validator.py` 依赖本地金样本数据：真实 1.21.10 世界与官方
@@ -837,7 +858,7 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 
 | Bug 描述 | 影响程度 | 临时方案 | 计划修复时间 |
 |---|---|---|---|
-| 在线模式服务器无法提取区块（加密） | 🔴 高 | 改用离线服 | 未计划（需 MITM 证书） |
+| 在线模式服务器代理模式无法抓取（AES 加密） | 🔴 高 | 代理已能**检测并提示**；抓取走镜像模式（M1+M2 已完成并通过测试桩链路验证，M3 实机测试待做） | 见 §11 P0 |
 | 拿不到生物群系注册表时退化为 `minecraft:plains` | 🟢 低 | 无（地形方块正确，仅颜色不准） | 不修（无注册表时猜反而更错） |
 | 首次握手同步下载方块表阻塞 ~10s | 🟡 中 | 预下载或 `--block-map` | 未计划 |
 | `VERSION_TABLES` 仅 47 / 754 / 758 / 773 / 777 | 🟢 低 | 其他版本自动走结构探测（已验证可用） | 可按需补充 |
@@ -886,7 +907,28 @@ ruff、mypy 全部复验通过：
 
 ### 待优化项
 
-- [ ] **MITM 加密层**（支持 `online-mode=true`）— 优先级：**P0**（这是唯一让工具在主流服务器上不可用的限制）
+- [ ] **正版服抓取（mc-mirror-agent 镜像模式）** — 优先级：**P0**。
+  路线已定（2026-10-24）：**放弃网络层 MITM**——`Encryption Request` 后的
+  hasJoined 会话绑定（客户端 join 登记的 hash 绑定其收到的公钥）让未经客户端
+  配合的中间人必然失败，此前的「自签名证书 + 信任链」设想不成立（协议无证书链）。
+  新路线：客户端 javaagent 插桩 netty 管道，在 `decrypt` 之后镜像**明文压缩帧**，
+  经 localhost 发给本程序 `--mirror-port`（镜像模式）；加密由客户端原 handler
+  完成，无 AES/认证问题，且不触碰混淆的 Minecraft 类（只碰包名稳定的 io.netty）。
+  **已落地（2026-10-24，M1+M2 完成）**：
+  * M1 Python 侧：`core/mirror.py`（`MirrorServer`/`MirrorSession`，协议
+    `MCMR`+方向帧）、`main.py --mirror-port`、套件 `mirror_test.py`（11 断言，
+    含真实固件端到端落盘）
+  * M2 agent：`agent/src/mcproxy/`（MirrorAgent premain + ByteBuddy Advice 插桩
+    `DefaultChannelPipeline.fireChannelActive` 与四个公开 `add*`；抽头锚定
+    {splitter,decrypt,decompressor} 管道序最靠后者之后，add* 钩子自动重定位——
+    重定位必须**新建 handler 实例**，netty 不允许复用已 remove 的实例）；
+    `agent/test/run_smoke.py` 用 netty 测试桩验证了「插桩→抽头→重定位→镜像→
+    Python 落盘」整条链路
+  * 代理模式检测 Encryption Request 并提示安装 agent（47/773 精确表 + 结构探测）；
+    `ProtocolParser.mirror_mode` 镜像模式只记信息日志
+  **待做（M3）**：真实游戏客户端实测（正版服、1.8/1.16/1.21 多版本、
+  PCL/官方启动器 JVM 参数）；实测中关注 agent 日志「已附加镜像抽头」与
+  Python「mc-mirror-agent 已连接」是否出现
 - [x] **生物群系注册表解析** — 已于 2.4.0 完成（1.8/1.16 数字表、Registry Codec、Registry Data 三路识别），不再是待办
 - [ ] **方块表下载改为异步**（避免握手阻塞 10 秒）— 优先级：P1
 - [ ] **补充 759–772 / 774 的精确 ID 表**（目前内置 47 / 754 / 758 / 773 / 777）— 优先级：P2
@@ -924,7 +966,7 @@ ruff、mypy 全部复验通过：
 - [ ] **数据库连接正常** — 本项目**无数据库**，确认 `core/data/blocks_773.json`（585 KB）存在
 - [ ] **本地启动成功** — `python main.py --target <离线服> ` 后 `Test-NetConnection -Port 25565` 返回 `TcpTestSucceeded : True`
 - [ ] **接口可访问** — 运行 `python main.py --help`，确认 9 个参数均列出
-- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（665 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）
+- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（14 套件 / 692 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；可选 `python agent/test/run_smoke.py` 验证 agent 链路（需 JDK）
 - [ ] **静态检查通过** — `python -m mypy core main.py tools/precheck.py tests/realdata_test.py` → `Success: no issues found in 17 source files`；`python -m ruff check .` → `All checks passed!`
 - [ ] **文档已阅读理解** — 重点理解第 10 节的 9 个坑点
 - [ ] **已知问题已知晓** — 特别是「在线模式不可用」与「ViaVersion 不翻译区块负载」
@@ -986,7 +1028,7 @@ level.dat 字段数: 23 | 世界名: e2e_world
 - 负责人：GitHub Copilot（DeepSeek V4.1 Flash）
 - 联系方式：VS Code Copilot Chat
 - 代码仓库：本地路径 `d:\yx\attack\mcserverfinder\MinecraftProxy`（**非 git 仓库**，无 remote）
-- 关键版本：`MinecraftProxy 2.4.0`（`core/__init__.py:10`）
+- 关键版本：`MinecraftProxy 2.5.0`（`core/__init__.py:10`）
 - 相关文档：
   - `README.md` — 使用说明与特性表
   - `docs/handoff/HANDOFF_MinecraftProxy_20261010.md` — 本文档

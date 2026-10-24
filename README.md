@@ -65,10 +65,70 @@ Minecraft Java 版协议代理：在客户端与服务器之间做**字节透明
 | Paper / Spigot / Purpur 等 Bukkit 系 | ✅ | 协议与 Vanilla 一致 |
 | Fabric / Forge / NeoForge 模组服 | ✅ | 自定义维度会各自建目录 |
 | BungeeCord / Velocity（传统转发） | ✅ | 握手 host 里的 `\0IP\0UUID\0属性` 后缀被完整保留 |
-| **Vanilla `online-mode=true`** | **❌** | 发 `Encryption Request`，之后是 AES 加密流，字节转发无法解密 |
+| **Vanilla `online-mode=true`** | **⚠️** | 字节代理无法解密 AES 流量；**检测到 `Encryption Request` 后会明确提示安装 mc-mirror-agent**（见下节），转发不受影响 |
 
-> 本工具适用于**离线模式**（`online-mode=false`）服务端。这是架构性限制，
-> 除非实现 MITM 证书替换，否则无法绕过。
+> 离线模式（`online-mode=false`）服务器**无需任何额外组件**，直接使用本代理即可。
+
+### 正版验证服务器（online-mode=true）
+
+字节代理架构上无法解密 AES 流量，因此程序的行为约定是：**离线服零依赖直接用；
+正版服检测到加密请求时明确提示，而不是默默无区块**。用代理模式连正版服时，
+程序在登录阶段识别到 `Encryption Request`（精确 ID 表 + 结构探测，任意版本可用）后打印：
+
+```text
+检测到正版验证服务器（online-mode=true）：服务器发送了 Encryption Request
+后续流量为 AES 加密，字节代理无法解析区块；转发不受影响，游戏仍可正常进行
+抓取正版服需要安装 mc-mirror-agent（镜像模式），详见 README 的「正版验证服务器」章节
+```
+
+此时游戏本身可正常玩，只是代理无法再解析区块。抓取正版服走 **mc-mirror-agent**
+（客户端 javaagent）：它在客户端进程内、netty 管道**解密之后**的位置把明文帧
+镜像给本程序——加密与正版认证完全由客户端原有逻辑完成，agent 不接触密钥、
+不修改任何字节，只旁路复制。
+
+#### 第一步：构建 agent（需要 JDK 8+，一次即可）
+
+```bash
+cd agent
+build.bat        # Windows；Linux/macOS 用 bash build.sh
+# 产物：agent/mc-mirror-agent.jar（约 9MB，内含 byte-buddy）
+```
+
+不想开游戏也可以先验证整条链路（netty 测试桩模拟客户端管道）：
+
+```bash
+python agent/test/run_smoke.py    # 预期：agent 冒烟: 3 通过, 0 失败
+```
+
+#### 第二步：配置启动器（每个游戏实例一次）
+
+在启动器（官方 / PCL / HMCL 均可）的 **JVM 参数** 里追加（注意是完整路径）：
+
+```text
+-javaagent:D:\path\to\mc-mirror-agent.jar=127.0.0.1:25566
+```
+
+> 也可以不改这一段，用 `-javaagent:D:\path\to\mc-mirror-agent.jar` 加系统属性
+> `-Dmcproxy.mirror=127.0.0.1:25566`；地址默认就是 `127.0.0.1:25566`。
+
+#### 第三步：抓取
+
+```bash
+python main.py --mirror-port 25566 --world-dir ./downloaded_world
+```
+
+然后正常启动游戏，加入任意服务器（**正版 / 离线验证均可**），四处走动收集区块，
+`Ctrl+C` 退出生成世界——与代理模式的用法一致。多人菜单的服务器列表 ping
+也会被镜像，程序会自动静默处理。
+
+#### 兼容性与说明
+
+- agent 只插桩包名稳定的 `io.netty`（客户端捆绑库），**不引用任何混淆的
+  Minecraft 类**，原版 / Fabric / Forge 客户端通用；依赖 vanilla 管道的
+  字符串常量名（`splitter` / `prepender` / `decrypt` / `decompressor`，1.8 起未变）
+- 加密/压缩 handler 是登录期动态插入的，agent 会在插入时自动重定位抽头锚点
+- 镜像队列满时丢帧不阻塞游戏；agent 连不上本程序时静默，游戏完全不受影响
+- 开游戏前也可预判目标服是否要求加密：`python tools/precheck.py <目标> --probe-login`
 
 ### 客户端
 
@@ -110,7 +170,8 @@ MinecraftProxy/
 ├── pyproject.toml          # 仅用于配置 mypy / ruff（无打包配置）
 ├── core/                   # 程序内部模块（非对外库）
 │   ├── __init__.py
-│   ├── proxy.py            # TCP 转发 + 会话管理
+│   ├── proxy.py            # TCP 转发 + 会话管理（代理模式）
+│   ├── mirror.py           # 镜像模式服务端（接收 agent 的明文帧，正版服用）
 │   ├── protocol.py         # 状态机 + 区块/注册表处理
 │   ├── packet_ids.py       # 版本自适应包 ID 解析
 │   ├── chunk_format.py     # 区块包 → Anvil NBT
@@ -124,6 +185,11 @@ MinecraftProxy/
 │   ├── varint.py           # VarInt / 帧切分
 │   ├── logger.py           # 日志
 │   └── data/               # 方块数据表缓存（首次运行自动下载）
+├── agent/                  # mc-mirror-agent（正版服镜像模式的 javaagent）
+│   ├── src/mcproxy/        # agent 源码（premain + netty 插桩 + 镜像客户端）
+│   ├── lib/                # byte-buddy（打进 fat jar）/ netty（仅编译期）
+│   ├── build.bat / .sh     # 一键构建 mc-mirror-agent.jar
+│   └── test/               # 无需游戏的链路冒烟测试（netty 测试桩）
 ├── tests/                  # 测试套件
 │   ├── fixtures/           # 真实服务器抓包固件（ViaVersion 未翻译负载）
 │   └── realdata_test.py    # 真实数据回归
@@ -147,6 +213,9 @@ python main.py --target 127.0.0.1:25565 --no-download
 # 手动指定方块数据（原版数据生成器的 reports/blocks.json 也可用）
 python main.py --target mc.example.com --block-map ./blocks.json
 
+# 镜像模式（正版验证服务器，需 mc-mirror-agent，见下文）
+python main.py --mirror-port 25566 --world-dir ./downloaded_world
+
 # 调试日志
 python main.py --target mc.example.com --debug
 ```
@@ -160,7 +229,8 @@ python main.py --target mc.example.com --debug
 |---|---|---|
 | `--local-host` | `127.0.0.1` | 本地监听地址 |
 | `--local-port` | `25565` | 本地监听端口 |
-| `--target` | 交互询问 | 目标服务器 `host[:port]` |
+| `--target` | 交互询问 | 目标服务器 `host[:port]`（镜像模式下不需要） |
+| `--mirror-port` | 无 | 镜像模式：监听该端口接收 mc-mirror-agent 的明文帧 |
 | `--world-dir` | `./downloaded_world` | 世界输出目录 |
 | `--block-map` | 无 | 指定 `blocks.json` |
 | `--no-download` | 关 | 禁止联网下载方块表 |
@@ -256,7 +326,7 @@ python run_tests.py selftest       # 单个套件（子串匹配）
 python tests/audit.py              # 能力边界审计
 ```
 
-当前 12 个套件共 665 条断言，全部通过：
+当前 14 个套件共 692 条断言，全部通过：
 
 | 套件 | 断言数 | 覆盖 |
 |---|---|---|
@@ -271,6 +341,8 @@ python tests/audit.py              # 能力边界审计
 | `robustness_test.py` | 70 | 负数 VarInt / 落盘 / 内存上限 / 网络 / 信号 / 客户端断开即结束 |
 | `realdata_test.py` | 56 | 真实抓包（ViaVersion 未翻译负载）/ 1.21.9 精确表 |
 | `biome_test.py` | 97 | **生物群系识别**（1.8 / 1.16 数字表 / 1.18+ 网络注册表 / 降采样 / 归一化） |
+| `onlinemode_test.py` | 16 | **正版服检测**（Encryption Request 探测 / 精确表别名 / agent 安装提示 / 镜像模式不告警） |
+| `mirror_test.py` | 11 | **镜像模式**（协议 magic / 登录链端到端 / 真实固件落盘 / STATUS 静默） |
 | `spec_validator.py` | 104 | **独立**规范校验（自写 NBT 读取器，对照真实 1.21.10 世界） |
 
 > 注：`spec_validator.py` 依赖本地金样本数据（真实 1.21.10 世界 + 官方
@@ -286,9 +358,10 @@ ruff check .
 
 ## 已知限制
 
-- **在线模式服务器（`online-mode=true`）无法使用**：`Set Compression` 之后服务端发送
-  `Encryption Request`，后续流量为 AES 加密。字节转发无法解密，这是架构性限制。
-  本工具适用于 `online-mode=false` 的服务器。
+- **在线模式服务器（`online-mode=true`）代理模式无法抓取**：`Set Compression` 之后服务端发送
+  `Encryption Request`，后续流量为 AES 加密，字节转发无法解密（架构性限制）。
+  代理会**自动检测并明确提示**安装 mc-mirror-agent（见「正版验证服务器」一节），
+  转发与游戏不受影响。
 - **协议 107 – 578（1.9 – 1.15.2）区块无法抓取**：这段版本的区块线格式与 1.18+ 差异较大，
   尚无对应解析器。转发不受影响，只是导出的世界里没有区块。
   （注：1.15+ 的「3D 生物群系」在 1.15 并未实际生效，1.16 才在**下界**真正启用）

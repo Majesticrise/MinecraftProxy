@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 以下导入必须在上面的 sys.path 设置之后（否则从其它 cwd 运行会找不到 core）
 from core.logger import set_global_level, setup_logger  # noqa: E402
+from core.mirror import MirrorServer  # noqa: E402
 from core.proxy import MinecraftProxy  # noqa: E402
 
 # 用程序名作为日志前缀，避免出现 "__main__" 这种不专业的名字
@@ -94,6 +95,13 @@ def build_parser():
         help="同时允许的客户端连接数上限 (默认: 8)",
     )
     parser.add_argument(
+        "--mirror-port",
+        type=int,
+        default=None,
+        help="镜像模式：监听该端口接收 mc-mirror-agent 的明文帧"
+             "（用于正版验证服务器；开启后无需 --target）",
+    )
+    parser.add_argument(
         "--no-prompt",
         action="store_true",
         help="不进行交互式提问（缺少参数时直接报错，适合脚本调用）",
@@ -146,10 +154,93 @@ def remove_signal_handlers(loop, installed) -> None:
                 pass
 
 
+async def _run_mirror(args) -> int:
+    """镜像模式：接收 mc-mirror-agent 从客户端进程内镜像出的明文帧。
+
+    适用于正版验证（online-mode=true）服务器——加密由客户端原有 handler
+    完成，agent 抄送的是解密后的明文，认证流程完全不受影响。
+    """
+    if not (1 <= args.mirror_port <= 65535):
+        logger.error(f"--mirror-port 取值非法: {args.mirror_port}")
+        return 2
+
+    if args.debug:
+        set_global_level(logging.DEBUG)
+        logger.info("已启用调试日志")
+
+    world_path = Path(args.world_dir)
+    world_path.mkdir(parents=True, exist_ok=True)
+    for dim in ("", "DIM-1", "DIM1"):
+        (world_path / dim / "region").mkdir(parents=True, exist_ok=True)
+
+    server = MirrorServer(
+        host="127.0.0.1",
+        port=args.mirror_port,
+        world_dir=args.world_dir,
+        debug=args.debug,
+        block_map=args.block_map,
+        allow_download=not args.no_download,
+        max_sessions=max(1, args.max_connections),
+    )
+
+    agent_jar = "mc-mirror-agent.jar"
+    print("\n=== Minecraft 镜像模式（mc-mirror-agent） ===\n")
+    print(f"  世界目录 : {world_path.absolute()}")
+    print(f"  镜像监听 : 127.0.0.1:{args.mirror_port}")
+    print("\n  等待 agent 连接。若游戏还没配置过，请在启动器的 JVM 参数中加入：\n")
+    print(f"      -javaagent:<{agent_jar} 的完整路径>=127.0.0.1:{args.mirror_port}")
+    print("\n  然后（重新）启动游戏，加入任意服务器（正版 / 离线验证均可），")
+    print("  四处走动收集区块，最后按 Ctrl+C 退出并生成世界。")
+    print("  提示：离线验证服务器也可以不用 agent，走默认代理模式（--target）。\n")
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _request_stop(signame: str) -> None:
+        logger.info(f"收到 {signame}，正在关闭...")
+        stop_event.set()
+
+    installed_signals = install_signal_handlers(loop, _request_stop)
+    server_task = asyncio.create_task(server.run(), name="mirror")
+    stop_task = asyncio.create_task(stop_event.wait(), name="stop-waiter")
+
+    try:
+        done, _ = await asyncio.wait(
+            {server_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done and not server_task.done():
+            server_task.cancel()
+        for task in (server_task, stop_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(server_task, stop_task, return_exceptions=True)
+        if server_task in done and stop_task not in done and not server_task.cancelled():
+            error = server_task.exception()
+            if error is not None:
+                raise error
+            if server.server is None:
+                logger.error("镜像服务未能启动（端口被占用？用 --mirror-port 换一个）")
+                return 1
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在关闭...")
+    except Exception as exc:
+        logger.error(f"镜像服务运行异常: {exc}", exc_info=True)
+        return 1
+    finally:
+        remove_signal_handlers(loop, installed_signals)
+        await server.shutdown()
+        logger.info("镜像模式已退出")
+    return 0
+
+
 async def run(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     no_prompt = args.no_prompt
+
+    if args.mirror_port:
+        return await _run_mirror(args)
 
     print("\n=== Minecraft 代理配置 ===\n")
 
@@ -237,6 +328,9 @@ async def run(argv=None):
             error = proxy_task.exception()
             if error is not None:
                 raise error
+            if proxy.server is None:
+                logger.error("代理服务器未能启动（端口被占用？用 --local-port 换一个）")
+                return 1
     except KeyboardInterrupt:
         logger.info("收到中断信号，正在关闭...")
     except Exception as exc:

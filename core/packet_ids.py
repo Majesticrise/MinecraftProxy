@@ -568,6 +568,23 @@ def detect_login_clientbound(payload: bytes) -> str | None:
             if name and _looks_like_player_name(name):
                 return "Login Success"
 
+    # Encryption Request: serverId(String) + publicKey(X.509 DER，0x30 开头)
+    #                    + verifyToken。正版验证（online-mode=true）的标志，
+    # 识别它用于在代理模式下明确提示安装 mc-mirror-agent（而不是默默无区块）
+    try:
+        buf = PacketBuffer(payload)
+        buf.read_string(64)
+        key_len = buf.read_varint()
+        if 80 <= key_len <= 1024 and buf.peek_ubyte() == 0x30:
+            buf.read(key_len)
+            token_len = buf.read_varint()
+            if 1 <= token_len <= 1024:
+                buf.read(token_len)
+                if buf.at_end():
+                    return "Encryption Request"
+    except Exception:
+        pass
+
     # Disconnect: JSON 文本
     try:
         buf = PacketBuffer(payload)

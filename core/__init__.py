@@ -7,4 +7,4 @@ MinecraftProxy 内部模块
 程序入口: ../main.py
 """
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"

@@ -37,6 +37,13 @@ core/data/blocks_*.json
 
 # 大型二进制（GitHub 单文件上限 100MB，服务端 jar 等一律不入库）
 *.jar
+# agent 的依赖 jar 例外：byte-buddy 打进 fat jar、netty 仅编译期使用
+!agent/lib/*.jar
+
+# ===== agent 构建产物 =====
+agent/build/
+agent/mc-mirror-agent.jar
+agent/test/classes/
 
 # ===== 本地参考资料（体积大，仅本机使用） =====
 # 真实 1.21.10 服务端与黄金样本世界（Paper jar / libraries / generated reports）
@@ -51,6 +58,7 @@ core/data/blocks_*.json
 .vscode/
 .idea/
 *.swp
+.zcode
 
 # ===== 操作系统 =====
 Thumbs.db
