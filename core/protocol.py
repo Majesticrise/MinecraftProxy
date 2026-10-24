@@ -36,6 +36,7 @@ from .chunk_format import (
     parse_flattened_chunk_data_packet,
     parse_legacy_chunk_data_packet,
     parse_legacy_map_chunk_bulk_packet,
+    parse_mid_chunk_data_packet,
     parse_unload_chunk_packet,
 )
 from .containers import parse_window_items
@@ -79,6 +80,8 @@ MAX_PENDING_ENTITIES_PER_CHUNK = 4096
 #   755 = 1.17, 756 = 1.17.1
 #   757 = 1.18 / 1.18.1, 758 = 1.18.2
 VERSION_LEGACY_1_8 = 47
+VERSION_MID_MIN = 107           # 1.9：方块实体内联进区块包 + 跨 long 位打包
+VERSION_MID_MAX = 340           # 1.12.2
 VERSION_FLATTENED_MIN = 735       # 1.16：带 groundUp + bitMap(varint)
 VERSION_FLATTENED_1_16_MAX = 754  # 1.16.5：最后一个带 groundUp 的版本
 VERSION_FLATTENED_1_17_MAX = 756  # 1.17.1：无 groundUp，bitMap 是 i64[]varint
@@ -92,6 +95,8 @@ def chunk_format_family(protocol_version: int | None) -> str:
         return "modern"
     if protocol_version <= VERSION_LEGACY_1_8:
         return "legacy"
+    if VERSION_MID_MIN <= protocol_version <= VERSION_MID_MAX:
+        return "mid"
     if VERSION_FLATTENED_MIN <= protocol_version <= VERSION_FLATTENED_1_17_MAX:
         return "flattened"
     return "modern"
@@ -491,10 +496,20 @@ class ProtocolParser:
     _on_encryption_begin = _on_encryption_request
 
     def _on_login_success(self, payload: bytes) -> None:
-        """Login Success: UUID(16) + String name + Prefixed Array of properties + Optional Session ID"""
+        """Login Success: UUID + String name [+ Prefixed Array of properties]
+
+        UUID 形态随版本而变：1.16 起为 16 字节，此前（1.8 ~ 1.15.2）为
+        36 字符带连字符字符串——这里按首字节自适应，不依赖协议号。
+        """
+        # 旧协议（< 1.20.2）没有 Login Acknowledged / 配置阶段，
+        # Login Success 之后客户端直接进入 PLAY，状态机同步切换
+        if self.state == ConnectionState.LOGIN and not self.resolver.uses_configuration_state():
+            self.state = ConnectionState.PLAY
+            logger.info("登录成功，直接进入 PLAY 状态（旧版无配置阶段）")
         try:
             buf = PacketBuffer(payload)
-            uuid_str = buf.read_uuid()
+            # VarInt 36 = 字符串长度（字符串 UUID 时代，≤ 1.15.2）
+            uuid_str = buf.read_string(64) if buf.peek_ubyte() == 36 else buf.read_uuid()
             username = buf.read_string(16)
             prop_count = 0
             if buf.remaining > 0:
@@ -521,6 +536,9 @@ class ProtocolParser:
         """尽力解析 Join Game 中的维度名，失败时保持默认（主世界）"""
         if self.chunk_family == "legacy":
             self._try_parse_dimension_legacy(payload)
+            return
+        if self.chunk_family == "mid":
+            self._try_parse_dimension_mid(payload)
             return
         # 1.16 ~ 1.20.1：生物群系注册表随 Join Game 的 Registry Codec 下发
         self._try_parse_registry_codec(payload)
@@ -587,6 +605,31 @@ class ProtocolParser:
             self.dimension_name = _dimension_name_from_id(dimension)
             self.section_count, self.min_section_y = 16, 0
             logger.debug(f"1.8 维度 ID={dimension} -> {self.dimension_name}")
+        except Exception:
+            pass
+
+    def _try_parse_dimension_mid(self, payload: bytes) -> None:
+        """
+        解析 1.9 ~ 1.12.2 的 Join Game（Login）包。
+
+        结构: Int entityId, UByte gameMode, Int dimension,
+              UByte difficulty, UByte maxPlayers, String levelType,
+              Bool reducedDebugInfo
+        与 1.8 的唯一差异：dimension 是 Int（1.8 是 Byte）。
+        """
+        try:
+            buf = PacketBuffer(payload)
+            buf.read_int()          # Entity ID
+            buf.read_ubyte()        # Game mode
+            dimension = buf.read_int()
+            # 只接受小整数（原版 -1/0/1，模组维度也是小 id），
+            # 防止结构探测误判时把垃圾值当成维度
+            if not -128 <= dimension <= 127:
+                return
+            self.dimension = dimension
+            self.dimension_name = _dimension_name_from_id(dimension)
+            self.section_count, self.min_section_y = 16, 0
+            logger.debug(f"1.9~1.12.2 维度 ID={dimension} -> {self.dimension_name}")
         except Exception:
             pass
 
@@ -681,6 +724,8 @@ class ProtocolParser:
         family = self.chunk_family
         if family == "legacy":
             return parse_legacy_chunk_data_packet(payload, registry=self.registry)
+        if family == "mid":
+            return parse_mid_chunk_data_packet(payload, registry=self.registry)
         if family == "flattened":
             # 1.16 与 1.17 的区块头不同：1.17 去掉了 groundUp，bitMap 改为 i64[]varint
             is_1_17 = (
@@ -792,7 +837,9 @@ class ProtocolParser:
 
     def _on_respawn(self, payload: bytes) -> None:
         """Respawn: 切换维度后需要更新世界高度"""
-        if self.chunk_family == "legacy":
+        # 1.8 与 1.9 ~ 1.12.2 的 Respawn 形状一致（Int dimension 开头），
+        # 共用 legacy 处理器
+        if self.chunk_family in ("legacy", "mid"):
             self._on_respawn_legacy(payload)
             return
         try:
@@ -811,10 +858,14 @@ class ProtocolParser:
             pass
 
     def _on_respawn_legacy(self, payload: bytes) -> None:
-        """1.8 Respawn: Int dimension(i32), UByte difficulty, UByte gamemode, String levelType"""
+        """1.8 / 1.9 ~ 1.12.2 Respawn: Int dimension(i32), UByte difficulty, UByte gamemode, String levelType"""
         try:
             buf = PacketBuffer(payload)
             dimension = buf.read_int()
+            # 只接受小整数（原版 -1/0/1，模组维度也是小 id），
+            # 防止结构探测误判时把垃圾值当成维度
+            if not -128 <= dimension <= 127:
+                return
             self.dimension = dimension
             self.dimension_name = _dimension_name_from_id(dimension)
             self.section_count, self.min_section_y = 16, 0

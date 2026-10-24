@@ -1,5 +1,5 @@
 """
-旧版（1.8 及更早）方块数字 ID -> 现代方块名称映射
+旧版（1.8 ~ 1.12.2）方块数字 ID -> 现代方块名称映射
 
 背景
 ----
@@ -7,17 +7,22 @@
 要求调色板里是 **方块名称**（`Name` + `Properties`）。两者之间没有公式可换算，
 必须有一张对照表。
 
-本模块把 1.8 的 `(block_id, metadata)` 解析为现代方块名（`minecraft:xxx`），
-再交给 `BlockStateRegistry.state_id_for_name()` 得到现代全局状态 ID，从而让
-1.8 的区块能写进现代 NBT。
+本模块把 1.8 ~ 1.12.2 的 `(block_id, metadata)` 解析为现代方块名
+（`minecraft:xxx`），再交给 `BlockStateRegistry.state_id_for_name()` 得到
+现代全局状态 ID，从而让旧版区块能写进现代 NBT。
 
 设计取舍
 --------
 * 数字 ID -> 名称：完整覆盖 1.8 的全部方块（数据取自 PrismarineJS
-  minecraft-data `pc/1.8/blocks.json`，已人工核对）。
+  minecraft-data `pc/1.8/blocks.json`，已人工核对）；
+  1.9 ~ 1.12.2 的新增方块（198~255）取自 `pc/1.12/blocks.json`——
+  1.9→1.12 数字 id 从未移位（1.13 扁平化的 DataFixer 即按 1.12 终版 id 编写），
+  因此一张表通吃整段。
 * metadata -> 变体：只覆盖真正会改变方块种类的方块（羊毛颜色、木板种类、
-  原木种类、台阶种类等）。纯朝向/开关类 metadata（如楼梯、火把、红石中继器）
-  不影响方块名称，直接忽略。
+  原木种类、台阶种类、1.12 混凝土颜色等）。纯朝向/开关类 metadata
+  （如楼梯、火把、红石中继器）不影响方块名称，直接忽略。
+  床的颜色（1.12 起 16 色）在这个时代存于方块实体 NBT，线路上只有红床，
+  统一映射为 red_bed。
 * 未知 ID：返回 None，由调用方降级为空气，保证文件始终可加载。
 """
 
@@ -225,6 +230,31 @@ LEGACY_BLOCK_NAMES: dict[int, str] = {
     195: "jungle_door",
     196: "acacia_door",
     197: "dark_oak_door",
+    # ---- 1.9 ~ 1.12.2 新增（id 取自 PrismarineJS pc/1.12/blocks.json，
+    #      1.9→1.12 数字 id 从未移位，一张表通吃整段；名称为扁平化后的现代名）
+    198: "end_rod",
+    199: "chorus_plant",
+    200: "chorus_flower",
+    201: "purpur_block",
+    202: "purpur_pillar",
+    203: "purpur_stairs",
+    # 204 purpur_double_slab：扁平化后无独立「双台阶」方块，归到 purpur_slab
+    204: "purpur_slab",
+    205: "purpur_slab",
+    206: "end_stone_bricks",       # 1.12 名 end_bricks
+    207: "beetroots",
+    208: "dirt_path",              # 1.12 名 grass_path
+    209: "end_gateway",
+    210: "repeating_command_block",
+    211: "chain_command_block",
+    212: "frosted_ice",
+    213: "magma_block",            # 1.12 名 magma
+    214: "nether_wart_block",
+    215: "red_nether_bricks",      # 1.12 名 red_nether_brick（现代名为复数）
+    216: "bone_block",
+    217: "structure_void",
+    218: "observer",
+    255: "structure_block",
 }
 
 # 16 种染料颜色后缀（metadata 0-15）
@@ -236,6 +266,13 @@ _DYE_COLORS = (
 
 # 6 种木材后缀（metadata 0-5）
 _WOODS = ("oak", "spruce", "birch", "jungle", "acacia", "dark_oak")
+
+# 1.11 / 1.12 的成组新增方块：16 色潜影盒（219~234）与釉面陶瓦（235~250）。
+# 颜色顺序与 _DYE_COLORS 完全一致（数据源：pc/1.12/blocks.json 逐一核对）。
+for _i, _color in enumerate(_DYE_COLORS):
+    LEGACY_BLOCK_NAMES[219 + _i] = f"{_color}_shulker_box"
+    LEGACY_BLOCK_NAMES[235 + _i] = f"{_color}_glazed_terracotta"
+del _i, _color
 
 
 def _dyed(name: str) -> dict[int, str]:
@@ -345,6 +382,11 @@ LEGACY_VARIANTS: dict[int, dict[int, str]] = {
           3: "player_head", 4: "creeper_head", 5: "dragon_head"},
     # 铁砧（仅损伤程度）
     145: {0: "anvil", 1: "chipped_anvil", 2: "damaged_anvil"},
+    # 1.12 混凝土 / 混凝土粉末：颜色在 metadata 里（id 251 / 252）
+    251: _dyed("concrete"),
+    252: _dyed("concrete_powder"),
+    # 床（26）：1.9 ~ 1.12.2 颜色在方块实体 NBT 里，线路上只有红床一种，
+    # 由 LEGACY_BLOCK_NAMES 的兜底条目处理（任何 metadata 都返回 red_bed）
 }
 
 

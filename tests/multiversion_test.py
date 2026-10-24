@@ -1,14 +1,15 @@
 """
-多版本兼容测试：1.8.9 / 1.16.5 / 1.18.2
+多版本兼容测试：1.8.9 / 1.9~1.12.2 / 1.16.5 / 1.18.2
 
 验证要点
 --------
 1. 1.8 legacy 区块解析（Blocks/Add/Data/BlockLight/SkyLight/Biomes 分组布局）
 2. 1.8 legacy (id, meta) -> 现代方块名映射
-3. 1.16.5 flattened 区块解析（bitMap + 独立生物群系数组）
-4. 1.18.2 caves 区块解析（无 fluid_count）
-5. 三种版本都能写出可被 nbt.parse_named_tag 解析的现代 Anvil NBT
-6. 协议版本家族分派正确
+3. 1.9 ~ 1.12.2 mid 区块解析（跨 long 位打包 + 节内交错光照 + 包内方块实体）
+4. 1.16.5 flattened 区块解析（bitMap + 独立生物群系数组）
+5. 1.18.2 caves 区块解析（无 fluid_count）
+6. 四种版本都能写出可被 nbt.parse_named_tag 解析的现代 Anvil NBT
+7. 协议版本家族分派正确
 """
 
 import os
@@ -26,8 +27,9 @@ from core.chunk_format import (
     parse_flattened_chunk_data_packet,
     parse_legacy_chunk_data_packet,
     parse_legacy_map_chunk_bulk_packet,
+    parse_mid_chunk_data_packet,
 )
-from core.datatypes import write_varint
+from core.datatypes import write_string, write_varint
 from core.legacy_blocks import legacy_block_name, legacy_state_id
 from core.protocol import ConnectionState, ProtocolParser, chunk_format_family
 
@@ -61,6 +63,11 @@ class FakeRegistry:
         "iron_ore", "coal_ore", "oak_log", "spruce_log", "oak_leaves",
         "white_wool", "red_wool", "black_wool", "glass", "light_blue_stained_glass",
         "diamond_ore", "bedrock", "water", "lava",
+        # 1.9 ~ 1.12.2 新增（追加在尾部，不影响上面的固定 ID）
+        "end_rod", "end_stone_bricks", "magma_block", "red_nether_bricks",
+        "dirt_path", "observer", "frosted_ice", "structure_block",
+        "beetroots", "bone_block", "white_glazed_terracotta",
+        "purple_shulker_box", "red_concrete", "white_concrete_powder",
     ]
 
     def __init__(self):
@@ -378,6 +385,222 @@ def test_legacy_state_id():
     check("未知方块返回 None", legacy_state_id(9999, 0, REGISTRY) is None)
 
 
+# --------------------------------------------------------------------------
+# 1.9 ~ 1.12.2 mid 区块构造
+# --------------------------------------------------------------------------
+def _pack_spanning(values, bits):
+    """把索引列表按「跨 long 边界」规则打包为 Long 列表（1.9 ~ 1.12.2 编码）"""
+    long_count = (len(values) * bits + 63) // 64
+    longs = [0] * long_count
+    mask = (1 << bits) - 1
+    for i, value in enumerate(values):
+        start = i * bits
+        lo = start // 64
+        offset = start % 64
+        longs[lo] |= ((value & mask) << offset) & 0xFFFFFFFFFFFFFFFF
+        if offset + bits > 64:
+            longs[lo + 1] |= (value & mask) >> (64 - offset)
+    return longs
+
+
+def build_mid_section(indices, palette, bpe, has_sky=True):
+    """构造 1.9 ~ 1.12.2 的单个 section
+
+    palette 为 None 表示直接模式（indices 即全局 id，bpe >= 9）。
+    """
+    out = bytearray()
+    out += bytes([bpe])
+    if palette is not None:
+        out += write_varint(len(palette))
+        for entry in palette:
+            out += write_varint(entry)
+    else:
+        out += write_varint(0)
+    longs = _pack_spanning(indices, bpe)
+    assert len(longs) == 64 * bpe  # 4096×bpe 恰被 64 整除
+    out += write_varint(len(longs))
+    for value in longs:
+        out += struct.pack(">Q", value)
+    out += bytes([0x11]) * 2048                 # BlockLight
+    if has_sky:
+        out += bytes([0xFF]) * 2048             # SkyLight
+    return bytes(out)
+
+
+def build_mid_chunk(cx, cz, ground_up=True, with_skylight=True, block_entities=()):
+    """构造一个 1.9 ~ 1.12.2 Chunk Data 包（单节：y=0 有数据）
+
+    palette 用 3 项（bpe=5，位打包跨 long 边界，正好覆盖解析器的跨界路径）：
+      0 = 空气, 1 = 石头 (1<<4), 2 = 红色混凝土 (251<<4 | 14)
+    """
+    palette = [0, 1 << 4, (251 << 4) | 14]
+    indices = [0] * 4096
+    indices[0] = 1
+    indices[1] = 2
+    indices[2] = 1
+    data = build_mid_section(indices, palette, bpe=5, has_sky=with_skylight)
+    if ground_up:
+        data += bytes([1]) * 256                # Biomes（plains=1）
+
+    payload = bytearray()
+    payload += struct.pack(">i", cx) + struct.pack(">i", cz)
+    payload += bytes([1 if ground_up else 0])
+    payload += write_varint(0x0001)             # primaryBitMask: 仅第 0 节
+    payload += write_varint(len(data))
+    payload += data
+    payload += write_varint(len(block_entities))
+    for entity in block_entities:
+        payload += nbt.build_root(entity, "")
+    return bytes(payload)
+
+
+def test_mid_parse():
+    print("\n== 1.9 ~ 1.12.2 mid 区块解析 ==")
+    entities = [{
+        "id": nbt.String("Chest"),        # 1.9 / 1.10 风格（未命名空间化）
+        "x": nbt.Int(10), "y": nbt.Int(64), "z": nbt.Int(-3),
+    }]
+    payload = build_mid_chunk(3, -5, ground_up=True, with_skylight=True,
+                              block_entities=entities)
+    chunk = parse_mid_chunk_data_packet(payload, registry=REGISTRY)
+    check("解析成功", chunk is not None)
+    if chunk is None:
+        return
+    check("坐标正确", chunk.x == 3 and chunk.z == -5, f"got {chunk.x},{chunk.z}")
+    check("16 节", len(chunk.sections) == 16, f"got {len(chunk.sections)}")
+    check("min_section_y=0", chunk.min_section_y == 0)
+
+    sec0 = chunk.sections[0]
+    stone_sid = REGISTRY.state_id_for_name("stone")
+    concrete_sid = REGISTRY.state_id_for_name("red_concrete")
+    check("第 0 节非空", sec0.block_count == 3, f"block_count={sec0.block_count}")
+    check("有天空光照", sec0.sky_light is not None and len(sec0.sky_light) == 2048)
+    check("有方块光照", sec0.block_light is not None and len(sec0.block_light) == 2048)
+    check("调色板含石头", sec0.block_palette is not None
+          and stone_sid in sec0.block_palette, f"{sec0.block_palette}")
+    check("调色板含红混凝土", sec0.block_palette is not None
+          and concrete_sid in sec0.block_palette)
+    if sec0.block_palette:
+        idx_stone = sec0.block_palette.index(stone_sid)
+        idx_conc = sec0.block_palette.index(concrete_sid)
+        check("索引 0 = 石头", sec0.block_states[0] == idx_stone)
+        check("索引 1 = 红混凝土(251:14)", sec0.block_states[1] == idx_conc)
+        check("索引 2 = 石头", sec0.block_states[2] == idx_stone)
+    check("第 1 节为空", chunk.sections[1].block_count == -1)
+
+    check("群系 256 项", chunk.chunk_biomes is not None
+          and len(chunk.chunk_biomes) == 256)
+    check("群系挂在第 0 节", sec0.biomes == chunk.chunk_biomes)
+
+    check("包内方块实体已解析", len(chunk.block_entities) == 1)
+    if chunk.block_entities:
+        entity = chunk.block_entities[0]
+        check("实体坐标为整数", (entity["x"], entity["y"], entity["z"]) == (10, 64, -3))
+        tile_id = str(entity["nbt"].get("id"))
+        check("1.9 风格 id 已规整", tile_id == "minecraft:chest", f"got {tile_id}")
+
+    raw = build_chunk_nbt(chunk, registry=REGISTRY, data_version=2975)
+    root, end = nbt.parse_named_tag(raw, 0)
+    check("NBT 可解析", end == len(raw), f"end={end} len={len(raw)}")
+    check("DataVersion=2975", root["DataVersion"] == 2975)
+    check("16 个 section", len(root["sections"]) == 16)
+    palette = root["sections"][0]["block_states"].get("palette")
+    names = [str(e.get("Name")) for e in palette] if palette else []
+    check("调色板是现代方块名",
+          "minecraft:red_concrete" in names and "minecraft:stone" in names, f"{names}")
+    be_list = root.get("block_entities")
+    check("方块实体写入 NBT", len(be_list) == 1
+          and str(be_list[0]["id"]) == "minecraft:chest")
+
+
+def test_mid_no_skylight():
+    print("\n== 1.9 ~ 1.12.2 无天空光照（下界）==")
+    payload = build_mid_chunk(1, 1, ground_up=True, with_skylight=False)
+    chunk = parse_mid_chunk_data_packet(payload, registry=REGISTRY)
+    check("解析成功（自动切换无天光假设）", chunk is not None)
+    if chunk:
+        check("第 0 节无天空光照", chunk.sections[0].sky_light is None)
+        check("第 0 节有方块光照", chunk.sections[0].block_light is not None)
+        check("方块正确解析", chunk.sections[0].block_count == 3)
+
+
+def test_mid_direct_mode():
+    print("\n== 1.9 ~ 1.12.2 直接模式（bpe=13，无调色板）==")
+    values = [0] * 4096
+    values[0] = (1 << 4) | 0          # 石头：全局 id 16
+    values[1] = (213 << 4) | 0        # magma_block：全局 id 3408
+    data = build_mid_section(values, None, bpe=13, has_sky=True)
+    payload = bytearray()
+    payload += struct.pack(">i", 2) + struct.pack(">i", 2)
+    payload += bytes([1]) + write_varint(0x0001)
+    payload += write_varint(len(data))
+    payload += data
+    payload += write_varint(0)         # 无方块实体
+    chunk = parse_mid_chunk_data_packet(bytes(payload), registry=REGISTRY)
+    check("解析成功", chunk is not None)
+    if chunk:
+        sec0 = chunk.sections[0]
+        magma_sid = REGISTRY.state_id_for_name("magma_block")
+        stone_sid = REGISTRY.state_id_for_name("stone")
+        check("第 0 节 2 个方块", sec0.block_count == 2, f"{sec0.block_count}")
+        check("调色板含石头", sec0.block_palette is not None
+              and stone_sid in sec0.block_palette)
+        check("调色板含 magma_block", sec0.block_palette is not None
+              and magma_sid in sec0.block_palette)
+
+
+def test_mid_dispatch():
+    print("\n== 1.9 ~ 1.12.2 协议分派与结构探测 ==")
+    for proto in (107, 210, 315, 335, 340):
+        check(f"{proto} -> mid", chunk_format_family(proto) == "mid")
+    check("341 不属于 mid", chunk_format_family(341) != "mid")
+    check("47 仍是 legacy", chunk_format_family(47) == "legacy")
+
+    payload = build_mid_chunk(6, -7)
+    parser = ProtocolParser(allow_download=False)
+    parser.protocol_version = 340
+    parser.resolver.set_protocol_version(340)
+    parser.chunk_family = chunk_format_family(340)
+    parser.section_count, parser.min_section_y = 16, 0
+    parsed = parser._parse_chunk_payload(payload)
+    check("340 经分派解析成功", parsed is not None)
+    if parsed is not None:
+        check("坐标正确", (parsed.x, parsed.z) == (6, -7))
+
+    # 结构探测（无精确 ID 表的版本靠 detect_play_clientbound）
+    from core.packet_ids import detect_play_clientbound
+    name = detect_play_clientbound(payload)
+    check("探测为 Chunk Data", name == "Chunk Data", f"got {name}")
+
+    # Join Game 探测（1.9 ~ 1.12.2 形状）
+    join = bytearray()
+    join += struct.pack(">i", 123)      # Entity ID
+    join += bytes([1])                  # Game mode
+    join += struct.pack(">i", 0)        # Dimension = 主世界
+    join += bytes([0])                  # Difficulty
+    join += bytes([20])                 # Max players
+    join += write_string("default")
+    join += bytes([0])                  # Reduced debug info
+    check("Join Game 探测", detect_play_clientbound(bytes(join)) == "Login (play)",
+          f"got {detect_play_clientbound(bytes(join))}")
+
+    # Respawn 探测
+    respawn = struct.pack(">i", -1) + bytes([1, 1]) + write_string("default")
+    check("Respawn 探测", detect_play_clientbound(respawn) == "Respawn",
+          f"got {detect_play_clientbound(respawn)}")
+
+    # 维度解析（mid Join Game 的 dimension 是 Int）
+    parser2 = ProtocolParser(allow_download=False)
+    parser2.chunk_family = "mid"
+    parser2._try_parse_dimension(bytes(join))
+    check("mid 维度解析", parser2.dimension_name == "minecraft:overworld",
+          f"got {parser2.dimension_name}")
+
+    # 畸形数据安全
+    check("空负载安全", parse_mid_chunk_data_packet(b"") is None)
+    check("截断负载安全", parse_mid_chunk_data_packet(payload[:20]) is None)
+
+
 def test_legacy_map_chunk_bulk():
     print("\n== 1.8 Map Chunk Bulk（0x26）==")
     # 两列：一列有天空光照，一列无（模拟下界）
@@ -535,6 +758,64 @@ def test_1_18_family_boundary():
     check("757 不误收 1.17 负载", parser2._parse_chunk_payload(legacy_1_17) is None)
 
 
+def test_mid_session_flow():
+    print("\n== 1.9 ~ 1.12.2 完整会话（握手→登录→区块→切维度）==")
+    parser = ProtocolParser(allow_download=False)
+    captured = []
+    parser.on_chunk_complete = lambda c, d: captured.append((c.x, c.z, d))
+
+    # 握手（协议 340 → LOGIN）
+    hs = write_varint(340) + write_string("localhost") + struct.pack(">H", 25565) + write_varint(2)
+    parser.process_serverbound(0x00, hs)
+    check("家族 mid", parser.chunk_family == "mid")
+    check("进入 LOGIN", parser.state.name == "LOGIN")
+
+    # Login Success：这个时代 UUID 是 36 字符字符串（1.16 起才是 16 字节）
+    parser.process_clientbound(
+        0x02, write_string("069a79f4-44e9-4726-a5be-fca90e38aaf5") + write_string("Steve"))
+    check("Login Success 后进入 PLAY", parser.state.name == "PLAY",
+          f"got {parser.state.name}")
+
+    # Join Game（维度 Int=0 主世界）
+    join = (struct.pack(">i", 123) + bytes([1]) + struct.pack(">i", 0)
+            + bytes([0]) + bytes([20]) + write_string("default") + bytes([0])
+            )
+    parser.process_clientbound(0x01, join)
+    check("Join Game 维度=主世界", parser.dimension_name == "minecraft:overworld")
+    check("is_joined 置位", parser.is_joined)
+
+    # Chunk Data（0x20，无精确表 → 结构探测）
+    parser.process_clientbound(0x20, build_mid_chunk(3, -5))
+    check("区块捕获回调", captured == [(3, -5, "minecraft:overworld")], f"{captured}")
+
+    # Respawn 到下界 + 无天光区块
+    respawn = struct.pack(">i", -1) + bytes([1, 1]) + write_string("default")
+    parser.process_clientbound(0x07, respawn)
+    check("Respawn 切下界", parser.dimension_name == "minecraft:the_nether")
+    parser.process_clientbound(0x20, build_mid_chunk(0, 0, with_skylight=False))
+    check("下界区块捕获", len(captured) == 2 and captured[1][2] == "minecraft:the_nether",
+          f"{captured}")
+
+
+def test_1_8_session_flow():
+    print("\n== 1.8 完整会话（原生客户端直连，Login Success 同为字符串 UUID）==")
+    parser = ProtocolParser(allow_download=False)
+    captured = []
+    parser.on_chunk_complete = lambda c, d: captured.append((c.x, c.z, d))
+
+    hs = write_varint(47) + write_string("localhost") + struct.pack(">H", 25565) + write_varint(2)
+    parser.process_serverbound(0x00, hs)
+    check("家族 legacy", parser.chunk_family == "legacy")
+
+    parser.process_clientbound(
+        0x02, write_string("069a79f4-44e9-4726-a5be-fca90e38aaf5") + write_string("Steve"))
+    check("Login Success 后进入 PLAY", parser.state.name == "PLAY",
+          f"got {parser.state.name}")
+
+    parser.process_clientbound(0x21, build_legacy_chunk(1, 2))   # 47: Chunk Data = 0x21
+    check("区块捕获", len(captured) == 1, f"{captured}")
+
+
 def main():
     print("== 多版本兼容测试 ==")
     test_legacy_parse()
@@ -542,6 +823,12 @@ def main():
     test_legacy_no_skylight()
     test_legacy_with_add()
     test_legacy_map_chunk_bulk()
+    test_mid_parse()
+    test_mid_no_skylight()
+    test_mid_direct_mode()
+    test_mid_dispatch()
+    test_mid_session_flow()
+    test_1_8_session_flow()
     test_flattened_parse()
     test_1_17_parse()
     test_1_18_family_boundary()

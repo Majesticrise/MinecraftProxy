@@ -781,6 +781,272 @@ def _legacy_section_states(blocks: bytes, registry: Any) -> list[int]:
 
 
 # --------------------------------------------------------------------------
+# 1.9 ~ 1.12.2 mid 区块解析
+# --------------------------------------------------------------------------
+# 包结构（协议 107 ~ 340，数据来源 wiki.vg《Chunk Data》/《Chunk Format》，
+# id 逐一核对 PrismarineJS pc/1.12/blocks.json）:
+#   Int x, Int z, Bool groundUp, VarInt primaryBitMask, VarInt size,
+#   Byte[] data, VarInt blockEntityCount + 具名 NBT 复合标签数组
+#   （这个时代的方块实体**就在区块包里**，每个 NBT 自带 x/y/z/id，
+#     也可以随后用 Update Block Entity 增量更新）
+#
+# data 内按 mask 位升序逐节交错排列：
+#   UByte bitsPerBlock
+#   VarInt paletteLen（0 = 直接模式，值即全局 id；>0 = VarInt[] 全局 id 调色板）
+#   VarInt longCount + Long[] data
+#   BlockLight 2048 B
+#   SkyLight   2048 B（仅主世界；下界/末地不发送）
+# 末尾 Biomes 256 B（仅 groundUp，索引 z*16+x，旧版数字群系 ID）。
+#
+# 调色板值 = 全局 id = (block_id << 4) | metadata（13 位）。
+# 与现代格式的两个关键差异：
+#   1. 位打包**跨 long 边界**（方块 5 的位 53~64 在第一个 long、位 65 起在
+#     第二个 long），4096×bpe 恰被 64 整除 → longCount 恒等于 64×bpe；
+#   2. 光照数组内嵌在每节之后，而不是包尾统一排列。
+MID_MIN_BPE = 4
+MID_MAX_BPE = 16          # Forge 可到 16
+MID_GLOBAL_ID_MAX = 0x1FFF  # 全局调色板 13 位
+
+
+def _unpack_spanning_long_array(
+    longs: list[int], bits: int, count: int
+) -> list[int]:
+    """
+    1.9 ~ 1.12.2 的位打包数组：值可以跨 long 边界（与 1.16+ 的不跨界不同）。
+
+    wiki.vg 给出的反序列化公式：
+        startLong = i*bits / 64;  offset = i*bits % 64
+        endLong = ((i+1)*bits - 1) / 64
+        跨界时 value = data[start] >> offset | data[end] << (64 - offset)
+    """
+    mask = (1 << bits) - 1
+    values: list[int] = []
+    for i in range(count):
+        start_bit = i * bits
+        start_long = start_bit >> 6
+        offset = start_bit & 63
+        end_long = (start_bit + bits - 1) >> 6
+        if end_long == start_long:
+            value = longs[start_long] >> offset
+        else:
+            value = (longs[start_long] >> offset) | (longs[end_long] << (64 - offset))
+        values.append(value & mask)
+    return values
+
+
+def _read_mid_section(buf: PacketBuffer, has_sky: bool, registry: Any) -> ChunkSection:
+    """解析 1.9 ~ 1.12.2 的单个 section（方块 + 内嵌光照）"""
+    bpe = buf.read_ubyte()
+    if not (MID_MIN_BPE <= bpe <= MID_MAX_BPE):
+        raise ChunkFormatError(f"mid 节位宽非法: {bpe}")
+
+    palette_len = buf.read_varint()
+    if palette_len < 0 or palette_len > SECTION_BLOCK_COUNT:
+        raise ChunkFormatError(f"mid 调色板长度非法: {palette_len}")
+    palette: list[int] | None = None
+    if palette_len > 0:
+        palette = []
+        for _ in range(palette_len):
+            entry = buf.read_varint()
+            if entry < 0 or entry > MID_GLOBAL_ID_MAX:
+                raise ChunkFormatError(f"mid 调色板项非法: {entry}")
+            palette.append(entry)
+    # palette_len == 0：直接模式（bpe >= 9），数据值即全局 id
+
+    long_count = buf.read_varint()
+    # 4096 × bpe 恰被 64 整除（4096 = 2^12），长度可精确校验
+    if long_count != 64 * bpe:
+        raise ChunkFormatError(f"mid 数据数组长度非法: {long_count} != {64 * bpe}")
+    longs = [buf.read_ulong() for _ in range(long_count)]
+
+    indices = _unpack_spanning_long_array(longs, bpe, SECTION_BLOCK_COUNT)
+    block_light = buf.read(LIGHT_ARRAY_SIZE)
+    sky_light = buf.read(LIGHT_ARRAY_SIZE) if has_sky else None
+
+    # 全局 id = (block_id << 4) | metadata -> 现代状态 id（同值只查一次）
+    cache: dict[int, int] = {}
+
+    def to_state(global_id: int) -> int:
+        if global_id in cache:
+            return cache[global_id]
+        state = legacy_state_id(global_id >> 4, global_id & 0x0F, registry) or 0
+        cache[global_id] = state
+        return state
+
+    if palette is not None:
+        mapped = [to_state(entry) for entry in palette]
+        if any(index >= len(mapped) for index in indices):
+            raise ChunkFormatError("mid 调色板索引越界")
+        states = [mapped[index] for index in indices]
+    else:
+        states = [to_state(index) for index in indices]
+
+    palette_out, indices_out, bits, single = _palettize_states(states)
+    section = ChunkSection(
+        block_count=sum(1 for state in states if state != 0),
+        fluid_count=0,
+        block_states=indices_out,
+        biomes=[],
+        block_palette=palette_out,
+        block_bits=bits,
+        block_single=single,
+    )
+    section.block_light = block_light
+    if sky_light is not None:
+        section.sky_light = sky_light
+    return section
+
+
+# 1.9 / 1.10 的方块实体 id 未命名空间化（TileEntity.register 的字面量），
+# 1.11+ 线路上已是 minecraft:xxx。写入 DataVersion 2975 的现代世界时
+# 必须规整，否则原版校验（仅允许 [a-z0-9_.-]）会丢弃整个方块实体。
+MID_TILE_IDS: dict[str, str] = {
+    "furnace": "minecraft:furnace",
+    "chest": "minecraft:chest",
+    "enderchest": "minecraft:ender_chest",
+    "sign": "minecraft:sign",
+    "mobspawner": "minecraft:spawner",
+    "music": "minecraft:jukebox",
+    "hopper": "minecraft:hopper",
+    "skull": "minecraft:skull",
+    "banner": "minecraft:banner",
+    "beacon": "minecraft:beacon",
+    "flowerpot": "minecraft:flower_pot",
+    "piston": "minecraft:piston",
+    "cauldron": "minecraft:cauldron",
+    "brewingstand": "minecraft:brewing_stand",
+    "enchanttable": "minecraft:enchanting_table",
+    "endgateway": "minecraft:end_gateway",
+    "control": "minecraft:command_block",
+    "structure": "minecraft:structure_block",
+    "dldetector": "minecraft:daylight_detector",
+    "comparator": "minecraft:comparator",
+    "dispenser": "minecraft:dispenser",
+    "dropper": "minecraft:dropper",
+    "airportal": "minecraft:end_portal",
+}
+
+
+def _parse_mid_block_entities(buf: PacketBuffer) -> list[dict[str, Any]]:
+    """解析 1.9 ~ 1.12.2 的包内方块实体（VarInt count + 具名 NBT 复合标签）"""
+    count = buf.read_varint()
+    if count < 0 or count > 4096:
+        raise ChunkFormatError(f"方块实体数量非法: {count}")
+    entities: list[dict[str, Any]] = []
+    for _ in range(count):
+        value, end = nbt.parse_named_tag(buf.data, buf.offset)
+        buf.offset = end
+        if not isinstance(value, dict):
+            raise ChunkFormatError("mid 方块实体不是复合标签")
+        try:
+            x, y, z = int(value["x"]), int(value["y"]), int(value["z"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ChunkFormatError("mid 方块实体缺少坐标") from exc
+        tile_id = value.get("id")
+        if isinstance(tile_id, str) and ":" not in tile_id:
+            normalized = MID_TILE_IDS.get(tile_id.lower())
+            if normalized is not None:
+                value["id"] = nbt.String(normalized)
+        entities.append({"x": x, "y": y, "z": z, "type_id": -1, "nbt": value})
+    return entities
+
+
+def parse_mid_chunk_data_packet(
+    payload: bytes,
+    registry: Any = None,
+) -> ParsedChunk | None:
+    """
+    解析 1.9 ~ 1.12.2 的 Chunk Data 包。
+
+    结构: Int x, Int z, Bool groundUp, VarInt primaryBitMask, VarInt size,
+          Bytes data, VarInt blockEntityCount + NBT[]
+
+    `registry` 为已加载的 `BlockStateRegistry`，用于把
+    (block_id, metadata) 映射为现代全局状态 ID；缺失时退化为空气。
+    """
+    try:
+        buf = PacketBuffer(payload)
+        chunk_x = buf.read_int()
+        chunk_z = buf.read_int()
+        if abs(chunk_x) > 1_000_000 or abs(chunk_z) > 1_000_000:
+            return None
+        ground_up = buf.read_bool()
+        bit_map = buf.read_varint()
+        if bit_map < 0 or bit_map > 0xFFFF:
+            return None
+        data_len = buf.read_varint()
+        if data_len < 0 or data_len > 16 * 1024 * 1024:
+            return None
+        data = buf.read(data_len)
+        if data_len and not data:
+            return None
+        block_entities = _parse_mid_block_entities(buf)
+        if not buf.at_end():
+            return None
+
+        included = [i for i in range(CLASSIC_SECTION_COUNT) if bit_map & (1 << i)]
+
+        # 天空光照是否发送无法从包头判断（仅主世界发送），按两个假设试解；
+        # 解析错位会在下一节的位宽/长度校验处快速失败。
+        parsed_map: dict[int, ChunkSection] | None = None
+        biomes: list[int] | None = None
+        for has_sky in (True, False):
+            try:
+                sec_buf = PacketBuffer(data)
+                sections: dict[int, ChunkSection] = {}
+                for section_index in included:
+                    sections[section_index] = _read_mid_section(
+                        sec_buf, has_sky, registry
+                    )
+                chunk_biomes: list[int] | None = None
+                remaining = sec_buf.remaining
+                if remaining == LEGACY_BIOME_COUNT:
+                    chunk_biomes = list(sec_buf.read(LEGACY_BIOME_COUNT))
+                elif remaining != 0:
+                    raise ChunkFormatError(f"mid 区块尾部剩余 {remaining} 字节")
+                if ground_up and chunk_biomes is None and included:
+                    # groundUp=true 的完整区块应带群系；不过部分服务端省略，
+                    # 保持容忍（缺群系只影响颜色，不影响方块）。
+                    pass
+                parsed_map = sections
+                biomes = chunk_biomes
+                break
+            except Exception:
+                continue
+        if parsed_map is None:
+            return None
+
+        # 归一化为 16 节列表（未发送的为空气）
+        section_list: list[ChunkSection] = []
+        for section_index in range(CLASSIC_SECTION_COUNT):
+            section = parsed_map.get(section_index)
+            if section is None:
+                section_list.append(ChunkSection(
+                    block_count=-1, fluid_count=0, block_states=[], biomes=[]
+                ))
+            else:
+                section_list.append(section)
+        if biomes is not None and section_list:
+            section_list[0].biomes = biomes
+
+        return ParsedChunk(
+            x=chunk_x,
+            z=chunk_z,
+            heightmaps={},
+            sections=section_list,
+            block_entities=block_entities,
+            light=None,
+            raw_section_bytes=data,
+            min_section_y=0,
+            section_count=CLASSIC_SECTION_COUNT,
+            # 1.9 ~ 1.12.2 的 256 字节是旧版数字生物群系 ID（同 1.8）
+            chunk_biomes=biomes,
+        )
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
 # 1.16.5 flattened 区块解析
 # --------------------------------------------------------------------------
 # 1.16.5 Chunk Data 包结构（PrismarineJS pc/1.16.2 proto.yml）:

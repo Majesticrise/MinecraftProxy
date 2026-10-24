@@ -3,6 +3,34 @@
 > ✅ **本文档已更新至 2026-10-24（对应版本 2.5.0：新增镜像模式 + mc-mirror-agent）**，与当前代码一致。
 >
 > 自 2026-10-24 起的修订（文档与代码重新对齐）：
+> - **新增 1.9 ~ 1.12.2（协议 107 ~ 340）区块抓取，第四个区块家族 `mid`**：
+>   - `chunk_format.py` 新增 `parse_mid_chunk_data_packet`：包结构
+>     `Int x, Int z, Bool groundUp, VarInt primaryBitMask, VarInt size, Bytes,
+>     VarInt blockEntityCount + 具名 NBT[]`（这个时代**方块实体就在区块包里**）
+>   - 与现代格式的关键差异：位打包**跨 long 边界**（`longCount` 恒等于
+>     64×bpe，4096×bpe 恒被 64 整除——这是硬校验）、光照**内嵌在每节之后**
+>     （非包尾分组）、下界/末地不发 SkyLight（按两个假设试解，错位会在
+>     下一节位宽校验处快速失败）
+>   - `legacy_blocks.py` 扩展 id 198~255（数据源 `pc/1.12/blocks.json`，
+>     1.9→1.12 id 从未移位，一张表通吃）：含 16 色潜影盒 219~234、
+>     釉面陶瓦 235~250、混凝土 251/252（metadata 16 色）、
+>     bed 26 统一映射 red_bed（这个时代颜色在方块实体 NBT 里）
+>   - 1.9/1.10 未命名空间化方块实体 id（`Chest`/`MobSpawner`/`Control`…）
+>     经 `MID_TILE_IDS` 规整为 `minecraft:xxx`（DataVersion 写 2975，
+>     现代原版只认 `[a-z0-9_.-]`）
+>   - 结构探测新增三个：mid Chunk Data / Join Game（维度是 **Int**，
+>     1.8 是 Byte）/ Respawn；`_try_parse_dimension_mid` + Respawn 复用
+>     legacy 处理器（形状一致），两者都加了 ±127 整数防抖
+>   - `PROTOCOL_DATA_VERSION`/`PRISMARINE_VERSION_DIRS` 补 107~340 →
+>     2975 / "1.18"（与 47 同策略：归一化为现代名后用 1.18 注册表）
+>   - 仍不支持：1.13 ~ 1.15.2（393 ~ 578，过渡格式未实现）
+> - **修复旧协议（< 1.20.2 原生直连）状态机进不了 PLAY 的预存在缺口**：
+>   `_on_login_success` 原先只记日志，LOGIN→PLAY 全靠 1.20.2+ 的
+>   `Login Acknowledged`——此前实测都经 ViaFabric（客户端侧 773）掩盖了洞。
+>   现在旧协议在 Login Success 后直接切 PLAY；同时 Login Success 的 UUID
+>   按**首字节自适应**（1.16 起为 16 字节，≤ 1.15.2 为 36 字符字符串），
+>   `detect_login_clientbound` 增加字符串 UUID 形态（精确消费）。原生
+>   1.8 直连同样受益，两个完整会话测试（340 / 47）已固化进 multiversion_test
 > - **修复 `spec_validator` 金样本路径**：金样本目录由 `你想要的/` 改名为
 >   `标准文件/` 后，独立校验器一直被**静默跳过**（`[跳过] 未找到真实基准世界`）。
 >   现按 `标准文件/` → `你想要的/` 依次探测；恢复后 **104/104 全部通过**
@@ -156,7 +184,7 @@ MinecraftProxy/
 │   ├── chunk_extractor.py       # .mca 区域文件写入
 │   ├── block_registry.py        # 方块状态 ID → 方块名
 │   ├── biome_registry.py        # [新增] 生物群系 ID → 名称（数字表 / 网络注册表）
-│   ├── legacy_blocks.py         # [新增] 1.8 数字 (id, meta) → 现代方块名
+│   ├── legacy_blocks.py         # [新增] 1.8 ~ 1.12.2 数字 (id, meta) → 现代方块名
 │   ├── level_dat.py             # level.dat 生成
 │   ├── nbt.py                   # NBT 读写（含匿名标签）
 │   ├── datatypes.py             # 有界二进制读取器
@@ -185,7 +213,7 @@ MinecraftProxy/
 | 文件路径 | 改动类型 | 作用 | 行数 |
 |---|---|---|---|
 | `main.py` | 新增 | 程序入口 + 命令行（唯一入口） | 260 |
-| `core/chunk_format.py` | 新增 | 区块包解析 + Anvil NBT 构建 | 1389 |
+| `core/chunk_format.py` | 新增 | 区块包解析 + Anvil NBT 构建 | 1655 |
 | `core/protocol.py` | 新增 | 协议状态机、区块分发、维度跟踪、注册表收集 | 881 |
 | `core/packet_ids.py` | 新增 | 版本自适应 ID 解析 | 772 |
 | `core/chunk_extractor.py` | 新增 | `.mca` 扇区分配与外置区块 | 615 |
@@ -319,7 +347,8 @@ print(len(raw), len(compress_chunk_nbt(raw)))  # 5362 428
 
 **相关文件位置**：
 - 实现：`core/chunk_format.py:445`（`parse_chunk_data_packet`）、`:1253`（`build_chunk_nbt`）、
-  `:370`（`_parse_sections_adaptive`）、`:564`/`:821`/`:958`（legacy / flattened / caves 变体）
+  `:370`（`_parse_sections_adaptive`）、`:564`/`:821`/`:958`（legacy / flattened / caves 变体）、
+  `:784`/`:954`（mid：1.9 ~ 1.12.2 跨 long 位打包变体）
 - 测试：`tests/usability_test.py`（91 项断言，含调色板为方块名、生物群系调色板类型、
   区块顶层必需键、光照、维度高度、`level.dat` 顶层 `DragonFight`）、
   `tests/realdata_test.py`（56 项，含真实抓包回归）
@@ -658,7 +687,7 @@ python -m mypy core main.py tools/precheck.py tests/realdata_test.py
 python -m ruff check .        # 预期：All checks passed!
 
 # 5. 运行测试（含自动下载方块表，首次约 10 秒）
-python run_tests.py           # 预期：全部测试通过（15 套件 / 745 断言）
+python run_tests.py           # 预期：全部测试通过（15 套件 / 802 断言）
 
 # 6. 启动代理（另开一个终端）
 python main.py --target mc.example.com:25565
@@ -713,7 +742,7 @@ tests/
 ├── version_test.py          248 行  # 版本自适应（无 ID 表纯探测）
 ├── edge_test.py             444 行  # 边界（直接调色板 / 光照 / TCP 分片 / 方块实体 NBT）
 ├── usability_test.py        373 行  # 导出世界可用性（核心验收）
-├── multiversion_test.py     557 行  # 多版本（1.8.9 / 1.16.5 / 1.17 / 1.18.2）
+├── multiversion_test.py     844 行  # 多版本（1.8.9 / 1.9~1.12.2 / 1.16.5 / 1.17 / 1.18.2）
 ├── version_dispatch_test.py  83 行  # 版本分派（家族 / 几何 / 维度）
 ├── robustness_test.py       612 行  # 健壮性（负数 VarInt / 落盘 / 内存 / 会话终止）
 ├── realdata_test.py         192 行  # 真实抓包回归（ViaVersion 未翻译负载）
@@ -749,7 +778,7 @@ python tools/precheck.py mc.example.com:25565
 python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 ```
 
-**测试覆盖范围**：共 **745 项断言**（含 15 项误判检查），全部通过。
+**测试覆盖范围**：共 **802 项断言**（含 15 项误判检查），全部通过。
 
 | 套件 | 断言数 | 通过 |
 |---|---|---|
@@ -986,7 +1015,7 @@ ruff、mypy 全部复验通过：
 ### 代码重构建议
 
 - **`protocol.py` 已达 881 行**：建议拆分为 `handlers/` 子包（login/config/play 分组），收益是可读性提升，便于按状态定位处理器。
-- **`chunk_format.py` 达 1389 行**：建议把「解析」与「NBT 构建」分成两个模块，收益是职责单一，测试更聚焦。
+- **`chunk_format.py` 达 1655 行**（新增 mid 家族后）：建议把「解析」与「NBT 构建」分成两个模块，收益是职责单一，测试更聚焦。
 
 ### 技术债务
 
@@ -1008,7 +1037,7 @@ ruff、mypy 全部复验通过：
 - [ ] **数据库连接正常** — 本项目**无数据库**，确认 `core/data/blocks_773.json`（585 KB）存在
 - [ ] **本地启动成功** — `python main.py --target <离线服> ` 后 `Test-NetConnection -Port 25565` 返回 `TcpTestSucceeded : True`
 - [ ] **接口可访问** — 运行 `python main.py --help`，确认 9 个参数均列出
-- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（15 套件 / 745 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；`python main.py --doctor` 自检应输出「环境就绪」
+- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（15 套件 / 802 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；`python main.py --doctor` 自检应输出「环境就绪」
 - [ ] **静态检查通过** — `python -m mypy core main.py tools/precheck.py tests/realdata_test.py` → `Success: no issues found in 17 source files`；`python -m ruff check .` → `All checks passed!`
 - [ ] **文档已阅读理解** — 重点理解第 10 节的 9 个坑点
 - [ ] **已知问题已知晓** — 特别是「在线模式不可用」与「ViaVersion 不翻译区块负载」

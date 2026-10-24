@@ -20,7 +20,7 @@ SUITES = [
     ("版本自适应测试（无 ID 表，纯结构探测）", "version_test.py"),
     ("边界测试（直接调色板 / 光照 / 分片）", "edge_test.py"),
     ("导出世界可用性测试（真实方块名 / 光照 / level.dat）", "usability_test.py"),
-    ("多版本兼容测试（1.8.9 / 1.16.5 / 1.18.2）", "multiversion_test.py"),
+    ("多版本兼容测试（1.8.9 / 1.9~1.12.2 / 1.16.5 / 1.18.2）", "multiversion_test.py"),
     ("协议版本分派测试（家族 / 几何 / 维度）", "version_dispatch_test.py"),
     ("健壮性回归测试（负数 VarInt / 落盘 / 内存上限 / 网络）", "robustness_test.py"),
     ("真实数据回归（ViaVersion 未翻译区块负载 / 1.21.9 精确表）", "realdata_test.py"),

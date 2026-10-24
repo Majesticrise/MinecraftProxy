@@ -20,6 +20,7 @@ from __future__ import annotations
 from .chunk_format import (
     parse_block_entity_data_packet,
     parse_chunk_data_packet,
+    parse_mid_chunk_data_packet,
     parse_update_light_packet,
 )
 from .datatypes import PacketBuffer, read_varint_bytes
@@ -45,6 +46,16 @@ DIR_SERVERBOUND = "SERVERBOUND"
 # --------------------------------------------------------------------------
 PROTOCOL_VERSION_NAMES: dict[int, str] = {
     47: "1.8.9",
+    107: "1.9",
+    108: "1.9.1",
+    109: "1.9.2",
+    110: "1.9.3 / 1.9.4",
+    210: "1.10 / 1.10.1 / 1.10.2",
+    315: "1.11",
+    316: "1.11.1 / 1.11.2",
+    335: "1.12",
+    338: "1.12.1",
+    340: "1.12.2",
     754: "1.16.5",
     758: "1.18.2",
     763: "1.20 / 1.20.1",
@@ -568,6 +579,18 @@ def detect_login_clientbound(payload: bytes) -> str | None:
             if name and _looks_like_player_name(name):
                 return "Login Success"
 
+    # Login Success（1.8 ~ 1.15.2）：UUID 是 36 字符带连字符字符串 + String name，
+    # 之后无属性数组（1.19 才引入），必须精确消费
+    try:
+        buf = PacketBuffer(payload)
+        uuid_str = buf.read_string(64)
+        if len(uuid_str) == 36 and uuid_str.count("-") == 4:
+            name = buf.read_string(16)
+            if _looks_like_player_name(name) and buf.at_end():
+                return "Login Success"
+    except Exception:
+        pass
+
     # Encryption Request: serverId(String) + publicKey(X.509 DER，0x30 开头)
     #                    + verifyToken。正版验证（online-mode=true）的标志，
     # 识别它用于在代理模式下明确提示安装 mc-mirror-agent（而不是默默无区块）
@@ -648,8 +671,14 @@ def detect_play_clientbound(payload: bytes) -> str | None:
         return "Update Light"
     if parse_block_entity_data_packet(payload) is not None:
         return "Block Entity Data"
+    if parse_mid_chunk_data_packet(payload) is not None:
+        return "Chunk Data"
     if _detect_play_join_game(payload):
         return "Login (play)"
+    if _detect_play_join_game_mid(payload):
+        return "Login (play)"
+    if _detect_respawn_mid(payload):
+        return "Respawn"
     if _detect_spawn_entity(payload):
         return "Spawn Entity"
     if _detect_map_data(payload):
@@ -657,6 +686,62 @@ def detect_play_clientbound(payload: bytes) -> str | None:
     if _detect_window_items(payload):
         return "Window Items"
     return None
+
+
+def _looks_like_level_type(value: str) -> bool:
+    """world type 字符串：default / flat / largeBiomes / default_1_1 等"""
+    return 0 < len(value) <= 16 and all(
+        ch.isalnum() or ch == "_" for ch in value
+    )
+
+
+def _detect_play_join_game_mid(payload: bytes) -> bool:
+    """
+    1.9 ~ 1.12.2 的 Join Game:
+      Int entityId, UByte gameMode(<=3), Int dimension(-1/0/1),
+      UByte difficulty(<=3), UByte maxPlayers, String levelType,
+      [Bool reducedDebugInfo]
+    """
+    if len(payload) < 14:
+        return False
+    try:
+        buf = PacketBuffer(payload)
+        buf.read_int()          # Entity ID
+        if buf.read_ubyte() > 3:
+            return False
+        if buf.read_int() not in (-1, 0, 1):
+            return False
+        if buf.read_ubyte() > 3:
+            return False
+        buf.read_ubyte()        # Max players
+        if not _looks_like_level_type(buf.read_string(32)):
+            return False
+        return buf.remaining <= 1
+    except Exception:
+        return False
+
+
+def _detect_respawn_mid(payload: bytes) -> bool:
+    """
+    1.9 ~ 1.12.2 的 Respawn:
+      Int dimension(-1/0/1), UByte difficulty(<=3), UByte gamemode(<=3),
+      String levelType，无剩余字节
+    """
+    if len(payload) < 8:
+        return False
+    try:
+        buf = PacketBuffer(payload)
+        if buf.read_int() not in (-1, 0, 1):
+            return False
+        if buf.read_ubyte() > 3:
+            return False
+        if buf.read_ubyte() > 3:
+            return False
+        if not _looks_like_level_type(buf.read_string(32)):
+            return False
+        return buf.at_end()
+    except Exception:
+        return False
 
 
 def _detect_spawn_entity(payload: bytes) -> bool:
