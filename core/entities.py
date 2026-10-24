@@ -56,10 +56,18 @@ class EntityTracker:
     # ------------------------------------------------------------------ 包解析
     def on_spawn_entity(self, payload: bytes, entity_names: dict[int, str]) -> bool:
         """
-        Spawn Entity（1.13+）：VarInt eid, UUID(16), VarInt type,
-        Double x/y/z, UByte pitch/yaw/headYaw, VarInt data, Short vx/vy/vz
-        （1.19~1.21.1 头部字段顺序略有差异，这里用「宽容读取 + 末尾校验」）
+        Spawn Entity（1.13+）。两种线格式都试（以「精确消费全部字节」为准，
+        与区块包的自适应同思路）：
+          * 1.13 ~ 1.21.1：VarInt eid, UUID(16), VarInt type, 3×Double,
+            UByte pitch/yaw/headYaw, VarInt data, 3×Short 速度
+          * 1.21.2+（实测 1.21.10）：删掉了 data 与速度字段
         """
+        if self._try_spawn(payload, entity_names, legacy=True):
+            return True
+        return self._try_spawn(payload, entity_names, legacy=False)
+
+    def _try_spawn(self, payload: bytes, entity_names: dict[int, str],
+                   legacy: bool) -> bool:
         try:
             buf = PacketBuffer(payload)
             eid = buf.read_varint()
@@ -70,11 +78,12 @@ class EntityTracker:
             z = buf.read_double()
             pitch = buf.read_ubyte()
             yaw = buf.read_ubyte()
-            buf.read_ubyte()   # 头部朝向
-            buf.read_varint()  # 附加数据
-            buf.read_short()   # 速度
-            buf.read_short()
-            buf.read_short()
+            if legacy:
+                buf.read_ubyte()   # 头部朝向
+                buf.read_varint()  # 附加数据
+                buf.read_short()   # 速度
+                buf.read_short()
+                buf.read_short()
             if not buf.at_end():
                 return False
             type_name = entity_names.get(type_id)

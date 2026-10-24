@@ -14,11 +14,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 由 netty 事件循环线程 offer（非阻塞，队满丢弃），独立 writer 线程
  * 负责连接 Python 侧并写出——任何失败都静默收尾，绝不影响游戏。
  *
+ * 注意：本类会被注入到 Fabric(Knot) 等隔离类加载器，**不得使用匿名/
+ * 内部类**（javac 生成的 $N 类不会随注入走，实测会 NoClassDefFoundError）。
+ *
  * 线上协议（与 core/mirror.py 对应）：
- *   连接后先发 b"MCMR" + 版本(1)
+ *   连接后先发 b"MCMR" + 版本号(1)
  *   之后每条消息 [方向 1B][帧长 4B 大端][明文裸帧]
  */
-final class MirrorSession {
+final class MirrorSession implements Runnable {
 
     static final int CLIENTBOUND = 0;   // 服务器 -> 客户端
     static final int SERVERBOUND = 1;   // 客户端 -> 服务器
@@ -32,14 +35,14 @@ final class MirrorSession {
     private final Thread writer;
 
     MirrorSession() {
-        writer = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                writeLoop();
-            }
-        }, "mcproxy-mirror-writer");
+        writer = new Thread(this, "mcproxy-mirror-writer");
         writer.setDaemon(true);
         writer.start();
+    }
+
+    @Override
+    public void run() {
+        writeLoop();
     }
 
     void offer(int direction, byte[] bareFrame) {
@@ -69,7 +72,7 @@ final class MirrorSession {
     private void writeLoop() {
         Socket socket = null;
         try {
-            String address = MirrorAgent.address();
+            String address = MirrorConfig.address();
             int colon = address.lastIndexOf(':');
             String host = colon > 0 ? address.substring(0, colon) : "127.0.0.1";
             int port = colon > 0 ? Integer.parseInt(address.substring(colon + 1)) : 25566;

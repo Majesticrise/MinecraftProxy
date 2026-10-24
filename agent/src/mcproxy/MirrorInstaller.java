@@ -20,10 +20,12 @@ import java.util.List;
  *          （encrypt 挂在 prepender 之前：addBefore("prepender","encrypt")）
  *
  * 抽头位置：
- *   入站 mcproxy_in —— 跟在 {splitter, decrypt, decompressor} 中**管道顺序
- *   最靠后**的那个之后。这里看到的是解密、解压全部完成后的明文裸帧
- *   [VarInt 包ID][载荷]（长度前缀已被 splitter 消费）。
- *   压缩/加密 handler 是登录阶段动态插入的，因此 add* 钩子负责重定位锚点。
+ *   入站 mcproxy_in —— **紧跟 "decoder"（包解码器）之前**。任何压缩实现
+ *   （vanilla 的 decompressor，或 Krypton 等优化 mod 用 velocity-native
+ *   替换的编解码器）都必须插在 decoder 之前——锚在这里永远看到解压后的
+ *   明文裸帧 [VarInt 包ID][载荷]，且不依赖压缩 handler 的名字。
+ *   实测坑：Krypton 劫持 Connection.setupCompression 换掉原版压缩器，
+ *   按名字锚定会停在压缩器之前、只看到压缩帧。
  *
  *   出站 mcproxy_out —— 挂在 prepender 之前。出站方向的处理顺序是从管道
  *   尾向头，先到我们、后到 encrypt，因此同样永远是明文（可能是已压缩的
@@ -34,7 +36,9 @@ public final class MirrorInstaller {
     static final String IN_NAME = "mcproxy_in";
     static final String OUT_NAME = "mcproxy_out";
 
-    /** 入站锚点候选（取管道顺序最靠后者） */
+    /** 入站抽头的首选锚点：包解码器之前 */
+    private static final String DECODER = "decoder";
+    /** 兜底锚点候选（无 decoder 时的退化路径） */
     private static final String[] IN_ANCHORS = {"splitter", "decrypt", "decompressor"};
     /** 识别 Minecraft 连接的管道标记（任一存在即可） */
     private static final String[] MC_MARKERS = {"packet_handler", "splitter"};
@@ -44,6 +48,9 @@ public final class MirrorInstaller {
 
     /** add* 钩子只关心这些名字（用于触发锚点重定位） */
     static boolean isWatchedName(String name) {
+        if (DECODER.equals(name)) {
+            return true; // 任何「插到 decoder 前」的新 handler（如替换的压缩器）
+        }
         for (String anchor : IN_ANCHORS) {
             if (anchor.equals(name)) {
                 return true;
@@ -74,21 +81,30 @@ public final class MirrorInstaller {
             if (existingOut == null && p.get("prepender") != null) {
                 p.addBefore("prepender", OUT_NAME, new MirrorHandler(session, false));
             }
-            String anchor = lastAnchor(p);
-            if (anchor != null) {
-                p.addAfter(anchor, IN_NAME, new MirrorHandler(session, true));
-            } else {
-                p.addFirst(IN_NAME, new MirrorHandler(session, true));
-            }
-            MirrorAgent.log("已附加镜像抽头 (" + channel.remoteAddress() + ")");
+            attachInbound(p, session);
+            MirrorConfig.log("已附加镜像抽头 (" + channel.remoteAddress() + ")");
         } catch (Throwable t) {
-            MirrorAgent.log("安装镜像抽头失败: " + t);
+            MirrorConfig.log("安装镜像抽头失败: " + t);
+        }
+    }
+
+    /** 把入站抽头放到「解压链之后、包解码之前」的位置 */
+    private static void attachInbound(ChannelPipeline p, MirrorSession session) {
+        if (p.get(DECODER) != null) {
+            p.addBefore(DECODER, IN_NAME, new MirrorHandler(session, true));
+            return;
+        }
+        String anchor = lastAnchor(p);
+        if (anchor != null) {
+            p.addAfter(anchor, IN_NAME, new MirrorHandler(session, true));
+        } else {
+            p.addFirst(IN_NAME, new MirrorHandler(session, true));
         }
     }
 
     /**
      * 管道发生 add* 之后：尚未安装则尝试安装（晚建立的连接），
-     * 已安装则检查入站锚点是否需要后移（decompressor/decrypt 晚到）。
+     * 已安装则检查入站锚点是否需要后移（压缩/加密 handler 晚到）。
      */
     static void resync(DefaultChannelPipeline pipeline) {
         ChannelPipeline p = pipeline;
@@ -99,24 +115,33 @@ public final class MirrorInstaller {
             }
             return;
         }
-        String desired = lastAnchor(p);
-        if (desired == null) {
-            return;
-        }
         List<String> names = p.names();
         int inIndex = names.indexOf(IN_NAME);
-        int desiredIndex = names.indexOf(desired);
-        if (inIndex < 0 || desiredIndex < 0 || inIndex > desiredIndex) {
-            return; // 已位于锚点之后
+        if (inIndex < 0) {
+            return;
+        }
+
+        // 首选位置：紧跟 decoder 之前（晚到的压缩器会插到我们与 decoder
+        // 之间，此时后移）。无 decoder 时退回「最靠后的兜底锚点之后」。
+        int decoderIndex = names.indexOf(DECODER);
+        if (decoderIndex >= 0) {
+            if (inIndex + 1 == decoderIndex) {
+                return; // 已紧贴 decoder
+            }
+        } else {
+            String desired = lastAnchor(p);
+            if (desired == null || inIndex > names.indexOf(desired)) {
+                return; // 已位于锚点之后
+            }
         }
         try {
             MirrorSession session = ((MirrorHandler) handler).session();
             p.remove(IN_NAME);
             // netty 不允许重复添加已 remove 的实例，必须换新 handler（共享 session）
-            p.addAfter(desired, IN_NAME, new MirrorHandler(session, true));
-            MirrorAgent.log("镜像抽头已重定位到 " + desired + " 之后");
+            attachInbound(p, session);
+            MirrorConfig.log("镜像抽头已重定位（当前管道: " + names + "）");
         } catch (Throwable t) {
-            MirrorAgent.log("重定位镜像抽头失败: " + t);
+            MirrorConfig.log("重定位镜像抽头失败: " + t);
         }
     }
 

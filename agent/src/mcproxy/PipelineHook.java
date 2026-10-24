@@ -20,7 +20,7 @@ public final class PipelineHook {
                 MirrorInstaller.install((DefaultChannelPipeline) pipeline);
             }
         } catch (Throwable t) {
-            MirrorAgent.log("channelActive 钩子失败: " + t);
+            MirrorConfig.log("channelActive 钩子失败: " + t);
         }
     }
 
@@ -42,7 +42,7 @@ public final class PipelineHook {
             }
             MirrorInstaller.resync((DefaultChannelPipeline) pipeline);
         } catch (Throwable t) {
-            MirrorAgent.log("add 钩子失败: " + t);
+            MirrorConfig.log("add 钩子失败: " + t);
         }
     }
 }

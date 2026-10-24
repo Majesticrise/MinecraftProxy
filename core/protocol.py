@@ -384,15 +384,20 @@ class ProtocolParser:
         except ValueError:
             self.state = ConnectionState.HANDSHAKE
 
+        # Status ping（多人菜单刷新）不值得加载方块表、刷 INFO——
+        # 一次刷新会产生几十个 ping 会话
+        is_login = self.state == ConnectionState.LOGIN
+
         version_name = PROTOCOL_VERSION_NAMES.get(protocol_version, "未知版本")
         mode = "精确 ID 表" if self.resolver.has_exact_table else "结构探测"
-        logger.info(
+        (logger.info if is_login else logger.debug)(
             f"客户端版本: 协议 {protocol_version} ({version_name}) -> 目标 {server_addr}:{server_port} "
             f"[ID 解析: {mode}]"
         )
 
         # 加载方块注册表（决定导出世界里的方块是否正确）
-        self._ensure_registry(protocol_version)
+        if is_login:
+            self._ensure_registry(protocol_version)
 
         # 旧版（1.8 / 1.16 / 1.17）的生物群系 ID 是硬编码的，用内置表；
         # 1.18+ 的生物群系注册表是动态的，等 Registry Data / Registry Codec。

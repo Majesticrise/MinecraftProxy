@@ -218,14 +218,18 @@ def test_entities():
           "Spawn Entity 解析成功")
     check(tracker.on_spawn_entity(spawn(101, 9, 200, 70, 300, uuid_a), names),
           "第二只实体")
-    check(tracker.count == 2, "快照共 2 个实体")
+    # 1.21.2+ 精简格式（无 data / 速度字段）
+    short_spawn = (write_varint(300) + uuid_a + write_varint(50)
+                   + struct.pack(">ddd", 5.0, 65.0, 5.0) + b"\x00\x00")
+    check(tracker.on_spawn_entity(short_spawn, names), "1.21.2+ 精简 Spawn 格式")
+    check(tracker.count == 3, "快照共 3 个实体")
     # 旧格式传送（末尾带 onGround）
     teleport = (write_varint(100) + struct.pack(">ddd", 12.0, 64.0, -21.0)
                 + b"\x00\x00" + b"\x01")
     check(tracker.on_entity_teleport(teleport, None), "Entity Teleport 更新")
     check(tracker.on_destroy_entities(write_varint(1) + write_varint(101)),
           "Destroy Entities")
-    check(tracker.count == 1, "销毁后剩 1 个")
+    check(tracker.count == 2, "销毁后剩 2 个")
     # Spawn Player
     check(tracker.on_spawn_player(write_varint(200) + uuid_a
                                   + struct.pack(">ddd", 0.5, 65, 0.5) + b"\x00\x00"),
@@ -235,7 +239,7 @@ def test_entities():
         with tempfile.TemporaryDirectory(prefix="ent_") as tmp:
             extractor = ChunkExtractor(tmp)
             total = await tracker.flush(tmp, 5023, extractor.save_entity_chunk)
-            check(total == 2, f"写入 2 个实体 (got {total})")
+            check(total == 3, f"写入 3 个实体 (got {total})")
             # 区块 (0,-2) 属于区域 r.0.-1（区域坐标 = 区块>>5）；玩家在 (0,0) -> r.0.0
             region = Path(tmp) / "entities" / "r.0.-1.mca"
             check(region.exists(), "entities/r.0.-1.mca 已生成")

@@ -333,7 +333,7 @@ python run_tests.py selftest       # 单个套件（子串匹配）
 python tests/audit.py              # 能力边界审计
 ```
 
-当前 15 个套件共 744 条断言，全部通过：
+当前 15 个套件共 745 条断言，全部通过：
 
 | 套件 | 断言数 | 覆盖 |
 |---|---|---|
@@ -350,7 +350,7 @@ python tests/audit.py              # 能力边界审计
 | `biome_test.py` | 97 | **生物群系识别**（1.8 / 1.16 数字表 / 1.18+ 网络注册表 / 降采样 / 归一化） |
 | `onlinemode_test.py` | 16 | **正版服检测**（Encryption Request 探测 / 精确表别名 / agent 安装提示 / 镜像模式不告警） |
 | `mirror_test.py` | 11 | **镜像模式**（协议 magic / 登录链端到端 / 真实固件落盘 / STATUS 静默） |
-| `extracapture_test.py` | 52 | **附加捕获**（容器三格式解析与两条合并路径 / 地图色板索引 / 实体 NBT 逐项 / 出生点 / doctor） |
+| `extracapture_test.py` | 53 | **附加捕获**（容器三格式解析与两条合并路径 / 地图色板索引 / 实体 NBT 逐项 / 出生点 / doctor） |
 | `spec_validator.py` | 104 | **独立**规范校验（自写 NBT 读取器，对照真实 1.21.10 世界） |
 
 > 注：`spec_validator.py` 依赖本地金样本数据（真实 1.21.10 世界 + 官方

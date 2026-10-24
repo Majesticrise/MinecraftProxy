@@ -46,28 +46,26 @@ def check(cond, msg):
 
 
 def compile_harness() -> bool:
-    if (HARNESS_CLS / "TestHarness.class").exists():
+    if (HARNESS_CLS / "TestHarness.class").exists() \
+            and (HARNESS_CLS / "HarnessRunner.class").exists():
         return True
     HARNESS_CLS.mkdir(parents=True, exist_ok=True)
     ret = subprocess.run(
         ["javac", "--release", "8", "-encoding", "UTF-8",
          "-cp", str(NETTY_JAR), "-d", str(HARNESS_CLS),
-         str(ROOT / "agent" / "test" / "TestHarness.java")],
-        capture_output=True, text=True,
+         str(ROOT / "agent" / "test" / "TestHarness.java"),
+         str(ROOT / "agent" / "test" / "HarnessRunner.java")],
+        capture_output=True,
     )
     if ret.returncode != 0:
-        print("  编译 TestHarness 失败:\n" + ret.stderr[:2000])
+        text = (ret.stderr or ret.stdout or b"").decode("gbk", errors="replace")
+        print("  编译 TestHarness 失败:\n" + text[:2000])
         return False
     return True
 
 
-async def main() -> int:
-    if not AGENT_JAR.exists():
-        print("  [FAIL] 未找到 agent/mc-mirror-agent.jar（先运行 agent/build.sh）")
-        return 1
-    if not compile_harness():
-        return 1
-
+async def run_phase(name: str, cmd: list[str], tmp: str) -> list[tuple[int, bytes]]:
+    """启动一个 java 测试进程并收集其镜像帧"""
     received: list[tuple[int, bytes]] = []
     original_feed = mirror_mod.MirrorSession._feed
 
@@ -78,43 +76,67 @@ async def main() -> int:
 
     mirror_mod.MirrorSession._feed = recording_feed
     try:
-        with tempfile.TemporaryDirectory(prefix="agent_smoke_") as tmp:
-            server = MirrorServer(host="127.0.0.1", port=0, world_dir=tmp,
-                                   allow_download=False)
-            check(await server.start(), "镜像服务启动")
-
-            port = server.port_number
-            cp_sep = ";" if os.name == "nt" else ":"
-            proc = subprocess.Popen(
-                ["java", f"-javaagent:{AGENT_JAR}=127.0.0.1:{port}",
-                 "-cp", f"{HARNESS_CLS}{cp_sep}{NETTY_JAR}",
-                 "TestHarness"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        server = MirrorServer(host="127.0.0.1", port=0, world_dir=tmp,
+                               allow_download=False)
+        check(await server.start(), f"[{name}] 镜像服务启动")
+        port = server.port_number
+        cp_sep = ";" if os.name == "nt" else ":"
+        proc_cmd = [part.format(port=port, agent=AGENT_JAR, cls=HARNESS_CLS,
+                                netty=NETTY_JAR, sep=cp_sep)
+                    for part in cmd]
+        proc = subprocess.Popen(proc_cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(None, proc.communicate),
+                timeout=30,
             )
-            try:
-                out, _ = await asyncio.wait_for(
-                    asyncio.get_running_loop().run_in_executor(None, proc.communicate),
-                    timeout=30,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                print("  [FAIL] 测试桩超时")
-                return 1
-            if b"HARNESS:DONE" not in (out or b""):
-                print("  测试桩输出（异常时排查用）:")
-                print("    " + (out or b"").decode("gbk", errors="replace")[:1500])
-            await asyncio.wait_for(server.shutdown(), timeout=10)
-
-            expected = [
-                (1, b"\x05hi"),     # 出站帧
-                (0, b"\x07yo"),     # 入站帧
-                (0, b"\x0czz"),     # 锚点重定位后的入站帧
-            ]
-            check(received == expected,
-                  f"收到且仅收到 3 帧且顺序一致 (got {received})")
-            check(server._ever_connected, "agent 曾成功连接")
+        except asyncio.TimeoutError:
+            proc.kill()
+            print(f"  [FAIL] [{name}] 测试桩超时")
+            return received
+        if b"HARNESS:DONE" not in (out or b""):
+            print(f"  [{name}] 测试桩输出（异常时排查用）:")
+            print("    " + (out or b"").decode("gbk", errors="replace")[:1500])
+        await asyncio.wait_for(server.shutdown(), timeout=10)
+        check(server._ever_connected, f"[{name}] agent 曾成功连接")
     finally:
         mirror_mod.MirrorSession._feed = original_feed
+    return received
+
+
+async def main() -> int:
+    if not AGENT_JAR.exists():
+        print("  [FAIL] 未找到 agent/mc-mirror-agent.jar（先运行 agent/build.sh）")
+        return 1
+    if not compile_harness():
+        return 1
+
+    expected = [
+        (1, b"\x05hi"),     # 出站帧
+        (0, b"\x07yo"),     # 入站帧
+        (0, b"\x0czz"),     # 锚点重定位后的入站帧
+    ]
+
+    # 阶段 1：系统类加载器（官方启动器的形态）
+    with tempfile.TemporaryDirectory(prefix="agent_smoke1_") as tmp:
+        received = await run_phase(
+            "系统加载器",
+            ["java", "-javaagent:{agent}=127.0.0.1:{port}",
+             "-cp", "{cls}{sep}{netty}", "TestHarness"],
+            tmp,
+        )
+        check(received == expected, f"[系统加载器] 收到 3 帧且顺序一致 (got {received})")
+
+    # 阶段 2：隔离类加载器（Fabric Knot / Forge 的形态，验证类注入）
+    with tempfile.TemporaryDirectory(prefix="agent_smoke2_") as tmp:
+        received = await run_phase(
+            "隔离加载器",
+            ["java", "-javaagent:{agent}=127.0.0.1:{port}",
+             "-cp", "{cls}", "HarnessRunner", "{cls}", "{netty}"],
+            tmp,
+        )
+        check(received == expected, f"[隔离加载器] 收到 3 帧且顺序一致 (got {received})")
 
     print(f"\nagent 冒烟: {PASS} 通过, {FAIL} 失败")
     return 1 if FAIL else 0

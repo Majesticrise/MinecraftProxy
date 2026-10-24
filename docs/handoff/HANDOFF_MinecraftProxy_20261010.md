@@ -658,7 +658,7 @@ python -m mypy core main.py tools/precheck.py tests/realdata_test.py
 python -m ruff check .        # 预期：All checks passed!
 
 # 5. 运行测试（含自动下载方块表，首次约 10 秒）
-python run_tests.py           # 预期：全部测试通过（15 套件 / 744 断言）
+python run_tests.py           # 预期：全部测试通过（15 套件 / 745 断言）
 
 # 6. 启动代理（另开一个终端）
 python main.py --target mc.example.com:25565
@@ -749,7 +749,7 @@ python tools/precheck.py mc.example.com:25565
 python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 ```
 
-**测试覆盖范围**：共 **744 项断言**（含 15 项误判检查），全部通过。
+**测试覆盖范围**：共 **745 项断言**（含 15 项误判检查），全部通过。
 
 | 套件 | 断言数 | 通过 |
 |---|---|---|
@@ -766,7 +766,7 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 | `biome_test.py` | 97 | ✅ 0 失败 |
 | `onlinemode_test.py` | 16 | ✅ 0 失败 |
 | `mirror_test.py` | 11 | ✅ 0 失败 |
-| `extracapture_test.py` | 52 | ✅ 0 失败 |
+| `extracapture_test.py` | 53 | ✅ 0 失败 |
 | `spec_validator.py` | 104 | ✅ 0 失败 |
 
 > ⚠️ `spec_validator.py` 依赖本地金样本数据：真实 1.21.10 世界与官方
@@ -939,6 +939,38 @@ ruff、mypy 全部复验通过：
   **待做（M3）**：真实游戏客户端实测（正版服、1.8/1.16/1.21 多版本、
   PCL/官方启动器 JVM 参数）；实测中关注 agent 日志「已附加镜像抽头」与
   Python「mc-mirror-agent 已连接」是否出现
+  - **M3 首轮实测反馈（2026-10-24）**：Fabric 1.21.10 + 149 mods
+    （含 ViaFabricPlus/Krypton）实测发现 **Knot 类加载器隔离**问题——
+    游戏的 netty 由 Knot 加载，解析内联的 `mcproxy.PipelineHook` 时看不见
+    agent 类，`NoClassDefFoundError` 直接打断了 `addLast`（连接即失败）。
+    **已修复**：插桩前用 `ClassInjector` 把注入侧五类
+    （MirrorConfig/PipelineHook/MirrorInstaller/MirrorHandler/MirrorSession）
+    反射定义进目标加载器；注入侧类**禁止匿名/内部类**（`$N` 类不会随注入走）；
+    与 agent 侧通过系统属性 `mcproxy.mirror.address` 传递地址。冒烟测试
+    扩为两阶段（系统加载器 + 隔离加载器 `HarnessRunner`），6/6 通过。
+    **待用户复测**（预期游戏日志出现「已把镜像类注入游戏类加载器」
+    「已附加镜像抽头」，且 ViaBedrock 初始化报错消失）
+  - **M3 第二轮实测反馈（同日）**：类注入修复生效——agent 连接、登录链
+    （Login Success → Login Acknowledged → Finish Configuration → PLAY）
+    全部解析成功，但**进世界 44 秒 0 区块**（小包能解析、Join Game/区块等
+    大包全灭）。定位：**Krypton**（astei，velocity-native）劫持
+    `Connection.setupCompression` **替换了原版 compressor/decompressor**，
+    按名字锚定的抽头停在压缩器之前、只看到压缩帧。
+    **已修复**：入站抽头改为锚定「紧跟 `decoder`（包解码器）之前」——
+    任何压缩实现都必须插在 decoder 之前，与名字无关；任何涉及 decoder 的
+    add* 都触发重定位。另修 ping 噪声：Status 会话不再加载方块表/刷 INFO。
+    冒烟 6/6（含重定位场景）。**待用户第三轮复测**
+  - **M3 第三轮实测（同日）：✅ 通过**。Fabric 1.21.10 + 149 mods
+    （Krypton/VMP/ViaFabricPlus）+ 离线服 wdsj.net 实测：**48 区块 / 0 失败**，
+    登录链、Join Game 维度（24 节）、区域写入、ping 静默全部正确。
+    管道快照证实锚定策略的关键性：该环境下压缩 handler 名为 `decompress`
+    （VMP 私有命名，非原版 `decompressor`），按名字锚定必败；锚 decoder +
+    重定位五次全部正确收敛（管道含 FlowControlHandler/inbound_config/
+    fabric:merger/bundler 等第三方 handler）。**本轮修复**：1.21.2 起
+    Spawn Entity 删除了 data/速度字段导致实体全灭——改为双格式自适应解析
+    （+1 断言）。**遗留观察**：正版服实测待做（加密由客户端处理，理论上
+    无差异）；玩家登录后 34 秒的大厅连接未产生镜像会话（疑似 limbo 未切换，
+    待下次观察）；debug 下「无处理器」日志较吵（可后续降噪）。
 - [x] **生物群系注册表解析** — 已于 2.4.0 完成（1.8/1.16 数字表、Registry Codec、Registry Data 三路识别），不再是待办
 - [ ] **方块表下载改为异步**（避免握手阻塞 10 秒）— 优先级：P1
 - [ ] **补充 759–772 / 774 的精确 ID 表**（目前内置 47 / 754 / 758 / 773 / 777）— 优先级：P2
@@ -976,7 +1008,7 @@ ruff、mypy 全部复验通过：
 - [ ] **数据库连接正常** — 本项目**无数据库**，确认 `core/data/blocks_773.json`（585 KB）存在
 - [ ] **本地启动成功** — `python main.py --target <离线服> ` 后 `Test-NetConnection -Port 25565` 返回 `TcpTestSucceeded : True`
 - [ ] **接口可访问** — 运行 `python main.py --help`，确认 9 个参数均列出
-- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（15 套件 / 744 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；`python main.py --doctor` 自检应输出「环境就绪」
+- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（15 套件 / 745 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；`python main.py --doctor` 自检应输出「环境就绪」
 - [ ] **静态检查通过** — `python -m mypy core main.py tools/precheck.py tests/realdata_test.py` → `Success: no issues found in 17 source files`；`python -m ruff check .` → `All checks passed!`
 - [ ] **文档已阅读理解** — 重点理解第 10 节的 9 个坑点
 - [ ] **已知问题已知晓** — 特别是「在线模式不可用」与「ViaVersion 不翻译区块负载」
