@@ -101,12 +101,24 @@ VERSION_TABLES: dict[int, dict[str, dict[str, int]]] = {
             "Login (play)": 0x01,
             "Chat Message": 0x02,
             "Set Time": 0x03,
+            "Entity Equipment": 0x04,
             "Set Default Spawn Position": 0x05,
             "Set Health": 0x06,
             "Respawn": 0x07,
             "Synchronize Player Position": 0x08,
+            "Entity Metadata": 0x1C,
+            "Entity Teleport": 0x18,
+            "Spawn Player": 0x0C,
+            "Spawn Entity": 0x0E,
+            "Entity Destroy": 0x13,
+            "Block Action": 0x24,
             "Chunk Data": 0x21,
+            "Open Window": 0x2D,
+            "Close Window": 0x2E,
+            "Set Slot": 0x2F,
             "Map Chunk Bulk": 0x26,
+            "Window Items": 0x30,
+            "Map": 0x34,
             "Block Entity Data": 0x35,
             "Disconnect": 0x40,
             "Set Compression": 0x46,
@@ -114,6 +126,10 @@ VERSION_TABLES: dict[int, dict[str, dict[str, int]]] = {
         "PLAY_SERVERBOUND": {
             "Keep Alive": 0x00,
             "Chat Message": 0x01,
+            "Position": 0x04,
+            "Position Look": 0x06,
+            "Use Item On": 0x08,
+            "Close Window": 0x0D,
             "Client Information": 0x15,
             "Client Status": 0x16,
         },
@@ -134,19 +150,36 @@ VERSION_TABLES: dict[int, dict[str, dict[str, int]]] = {
             "Login Plugin Response": 0x02,
         },
         "PLAY_CLIENTBOUND": {
+            "Spawn Entity": 0x00,
+            "Spawn Player": 0x04,
             "Block Entity Data": 0x09,
+            "Block Action": 0x0A,
+            "Close Window": 0x12,
+            "Window Items": 0x13,
+            "Set Slot": 0x15,
             "Disconnect": 0x19,
             "Unload Chunk": 0x1C,
             "Keep Alive": 0x1F,
             "Chunk Data": 0x20,
             "Update Light": 0x23,
             "Login (play)": 0x24,
+            "Map": 0x25,
+            "Entity Destroy": 0x36,
+            "Open Window": 0x2D,
+            "Position": 0x34,
             "Respawn": 0x39,
+            "Entity Metadata": 0x44,
+            "Entity Equipment": 0x47,
+            "Entity Teleport": 0x56,
         },
         "PLAY_SERVERBOUND": {
             "Confirm Teleportation": 0x00,
             "Client Information": 0x05,
+            "Close Window": 0x0A,
             "Keep Alive": 0x10,
+            "Position": 0x12,
+            "Position Look": 0x13,
+            "Use Item On": 0x2E,
         },
     },
     # --------------------------------------------------------------- 1.18.2
@@ -165,19 +198,36 @@ VERSION_TABLES: dict[int, dict[str, dict[str, int]]] = {
             "Login Plugin Response": 0x02,
         },
         "PLAY_CLIENTBOUND": {
+            "Spawn Entity": 0x00,
+            "Spawn Player": 0x04,
             "Block Entity Data": 0x0A,
+            "Block Action": 0x0B,
+            "Close Window": 0x13,
+            "Window Items": 0x14,
+            "Set Slot": 0x16,
             "Disconnect": 0x1A,
             "Unload Chunk": 0x1D,
             "Keep Alive": 0x21,
             "Chunk Data and Update Light": 0x22,
             "Update Light": 0x25,
             "Login (play)": 0x26,
+            "Map": 0x27,
+            "Open Window": 0x2E,
+            "Position": 0x38,
+            "Entity Destroy": 0x3A,
             "Respawn": 0x3D,
+            "Entity Metadata": 0x4D,
+            "Entity Equipment": 0x50,
+            "Entity Teleport": 0x62,
         },
         "PLAY_SERVERBOUND": {
             "Confirm Teleportation": 0x00,
             "Client Information": 0x05,
+            "Close Window": 0x09,
             "Keep Alive": 0x0F,
+            "Position": 0x11,
+            "Position Look": 0x12,
+            "Use Item On": 0x2E,
         },
     },
     # --------------------------------------------------------- 1.21.9 / 1.21.10
@@ -498,17 +548,24 @@ VERSION_TABLES: dict[int, dict[str, dict[str, int]]] = {
         },
         "PLAY_CLIENTBOUND": {
             "Bundle Delimiter": 0x00,
+            "Spawn Entity": 0x01,
             "Block Entity Data": 0x06,
-            "Chunk Batch Finished": 0x0B,
-            "Chunk Batch Start": 0x0C,
-            "Chunk Biomes": 0x0D,
+            "Block Action": 0x07,
+            "Close Window": 0x11,
+            "Window Items": 0x12,
+            "Set Slot": 0x14,
             "Disconnect": 0x20,
             "Keep Alive": 0x2D,
             "Chunk Data and Update Light": 0x2E,
             "Update Light": 0x31,
-            "Login (play)": 0x32,
-            "Set Center Chunk": 0x60,
             "Unload Chunk": 0x26,
+            "Login (play)": 0x32,
+            "Map": 0x34,
+            "Set Center Chunk": 0x60,
+            "Open Window": 0x3C,
+            "Entity Destroy": 0x4E,
+            "Entity Metadata": 0x65,
+            "Entity Equipment": 0x68,
             "Start Configuration": 0x78,
             "Respawn": 0x54,
             "Synchronize Player Position": 0x49,
@@ -521,6 +578,7 @@ VERSION_TABLES: dict[int, dict[str, dict[str, int]]] = {
             "Chunk Batch Received": 0x0B,
             "Client Information": 0x0E,
             "Acknowledge Configuration": 0x10,
+            "Close Window": 0x13,
             "Keep Alive": 0x1C,
             "Set Player Position": 0x1E,
             "Set Player Position and Rotation": 0x1F,
@@ -854,6 +912,28 @@ class PacketIdResolver:
     @property
     def has_exact_table(self) -> bool:
         return bool(self.table)
+
+    def set_generated_tables(self, tables: dict[str, dict[str, int]]) -> None:
+        """
+        合并运行时生成的精确 ID 表（protocol.json 提取）。
+
+        仅当该版本没有内置表时调用（内置表逐项核对过，优先级更高）。
+        合并后 `has_exact_table` 为真，包识别优先走精确匹配。
+        """
+        if self.table:
+            return
+        for key, entries in tables.items():
+            if not entries:
+                continue
+            merged = dict(self.table.get(key, {}))
+            merged.update(entries)
+            self.table[key] = merged
+        self._by_name = {
+            key: {pid: name for name, pid in ids.items()}
+            for key, ids in self.table.items()
+        }
+        self._cache.clear()
+        self._probe_attempts.clear()
 
     def uses_configuration_state(self) -> bool:
         if self.protocol_version is None:

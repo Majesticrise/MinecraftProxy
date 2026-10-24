@@ -747,8 +747,35 @@ class ChunkExtractor:
 # --------------------------------------------------------------------------
 # 容器内容合并的辅助（操作对象是已构建/已保存的区块 NBT 根字典）
 # --------------------------------------------------------------------------
+# 双箱（大箱子）的两个朝向属性值：左半格在窗口物品列表的前 27 格
+_DOUBLE_CHEST_BLOCKS = ("minecraft:chest", "minecraft:trapped_chest")
+_CHEST_HALF_SLOTS = 27
+
+
 def _merge_items_into_root(root: dict, x: int, y: int, z: int, items: list) -> bool:
-    """把 Items 合并进 (x,y,z) 的方块实体；实体不存在时按方块名补建。"""
+    """把 Items 合并进 (x,y,z) 的方块实体；实体不存在时按方块名补建。
+
+    双箱（54 格内容）会自动拆成 27+27 写进两个半格：
+      * 1.13+：由方块状态的 type 属性（left/right）精确判定哪半格拿前 27 格；
+      * 更早版本（我们的旧版导出不含属性）：按「坐标小的半格拿前 27 格」
+        的确定规则拆分——朝向未知，两半各有一半概率对调（打开时可见顺序颠倒，
+        内容不丢）。
+    """
+    block_name, properties = _block_state_at(root, x, y, z)
+    if block_name in _DOUBLE_CHEST_BLOCKS and len(items) == _CHEST_HALF_SLOTS * 2:
+        neighbor = _find_double_chest_neighbor(root, x, y, z, block_name)
+        if neighbor is not None:
+            nx, nz = neighbor
+            this_first = _this_half_is_first(properties, x, z, nx, nz)
+            first, second = items[:_CHEST_HALF_SLOTS], items[_CHEST_HALF_SLOTS:]
+            _reslot(first)
+            _reslot(second)
+            mine = first if this_first else second
+            other = second if this_first else first
+            _merge_items_into_root(root, x, y, z, mine)
+            _merge_items_into_root(root, nx, y, nz, other)
+            return True
+
     entities_list = root.get("block_entities")
     if not isinstance(entities_list, nbt.List):
         return False
@@ -763,7 +790,6 @@ def _merge_items_into_root(root: dict, x: int, y: int, z: int, items: list) -> b
         except Exception:
             continue
     # 2) 不存在 -> 从区块数据反查方块名，确认是容器才补建
-    block_name = _block_name_at(root, x, y, z)
     be_id = container_entity_id(block_name)
     if not be_id:
         logger.debug(f"({x},{y},{z}) 不是容器方块（{block_name}），忽略容器内容")
@@ -779,38 +805,84 @@ def _merge_items_into_root(root: dict, x: int, y: int, z: int, items: list) -> b
     return True
 
 
-def _block_name_at(root: dict, x: int, y: int, z: int) -> str | None:
-    """从区块 NBT 里读世界坐标 (x,y,z) 处的方块资源名（调色板 + 位打包还原）"""
+def _reslot(items: list) -> None:
+    """把拆分后的半箱物品重新编号为 0~26（右半格原 Slot 是 27~53）"""
+    for index, entry in enumerate(items):
+        entry["Slot"] = nbt.Byte(index)
+
+
+def _find_double_chest_neighbor(
+    root: dict, x: int, y: int, z: int, block_name: str
+) -> tuple[int, int] | None:
+    """在四个水平邻居里找同种箱子（找到即为双箱）"""
+    for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        name, _props = _block_state_at(root, x + dx, y, z + dz)
+        if name == block_name:
+            return (x + dx, z + dz)
+    return None
+
+
+def _this_half_is_first(
+    properties: dict | None, x: int, z: int, nx: int, nz: int
+) -> bool:
+    """判定 (x,z) 半格是否对应窗口物品列表的前 27 格。
+
+    * 有 type 属性（1.13+）：type=left -> 前 27 格（left/right 由朝向
+      几何关系定义，方块状态里已带）；
+    * 无属性（旧版导出）：坐标字典序小的半格拿前 27 格（确定规则）。
+    """
+    if isinstance(properties, dict):
+        chest_type = properties.get("type")
+        if chest_type == "left":
+            return True
+        if chest_type == "right":
+            return False
+    return (x, z) < (nx, nz)
+
+
+def _block_state_at(root: dict, x: int, y: int, z: int) -> tuple[str | None, dict | None]:
+    """从区块 NBT 里读 (x,y,z) 处的 (方块资源名, 属性字典)"""
     try:
         sections = root.get("sections")
         if not sections:
-            return None
+            return None, None
         y_sec = y >> 4
         for section in sections:
             if int(section.get("Y", 999)) != y_sec:
                 continue
             states = section.get("block_states")
             if not isinstance(states, dict):
-                return None
+                return None, None
             palette = states.get("palette")
             if not palette:
-                return None
-            if len(palette) == 1:
-                return str(palette[0].get("Name", ""))
-            data = states.get("data")
-            if not data:
-                return None
-            bits = max(4, (len(palette) - 1).bit_length())
-            index = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)  # YZX
-            per_long = 64 // bits
-            long_index = index // per_long
-            bit_offset = (index % per_long) * bits
-            if long_index >= len(data):
-                return None
-            value = (int(data[long_index]) >> bit_offset) & ((1 << bits) - 1)
-            if value >= len(palette):
-                return None
-            return str(palette[value].get("Name", ""))
+                return None, None
+            entry = palette[0] if len(palette) == 1 else None
+            if entry is None:
+                data = states.get("data")
+                if not data:
+                    return None, None
+                bits = max(4, (len(palette) - 1).bit_length())
+                index = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)  # YZX
+                per_long = 64 // bits
+                long_index = index // per_long
+                bit_offset = (index % per_long) * bits
+                if long_index >= len(data):
+                    return None, None
+                value = (int(data[long_index]) >> bit_offset) & ((1 << bits) - 1)
+                if value >= len(palette):
+                    return None, None
+                entry = palette[value]
+            name = str(entry.get("Name", ""))
+            raw_props = entry.get("Properties")
+            properties = None
+            if isinstance(raw_props, dict) and raw_props:
+                properties = {str(k): str(v) for k, v in raw_props.items()}
+            return name, properties
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
+
+
+def _block_name_at(root: dict, x: int, y: int, z: int) -> str | None:
+    """兼容入口：只取方块名（调色板 + 位打包还原）"""
+    return _block_state_at(root, x, y, z)[0]

@@ -28,6 +28,7 @@ SUITES = [
     ("正版服检测（Encryption Request 识别 / 提示安装 agent）", "onlinemode_test.py"),
     ("镜像模式（mc-mirror-agent 协议 / 端到端 / STATUS 静默）", "mirror_test.py"),
     ("附加捕获（容器内容 / 地图画 / 实体快照 / 出生点）", "extracapture_test.py"),
+    ("运行时协议数据（protocol.json 求值器 / 精确表 / Set Slot / 装备 / 双箱）", "protosession_test.py"),
     ("独立规范校验（对照真实 1.21.10 世界，不依赖项目代码）", "spec_validator.py"),
 ]
 

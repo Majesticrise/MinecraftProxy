@@ -3,6 +3,42 @@
 > ✅ **本文档已更新至 2026-10-24（对应版本 2.5.0：新增镜像模式 + mc-mirror-agent）**，与当前代码一致。
 >
 > 自 2026-10-24 起的修订（文档与代码重新对齐）：
+> - **新增 `core/protocol_json.py`：Prismarine protocol.json 的运行时解析**（两大能力）：
+>   - **精确 ID 表生成**：内置表缺失的版本（33 个正式版有数据目录）握手时自动
+>     下载并生成「包名→ID」表合并进 resolver，包识别从结构探测升级为精确匹配；
+>     别名表把 prismarine 名（map_chunk/block_place/named_entity_spawn…）映射到
+>     本项目包名。**注意 26.1=协议 775 不是 777**，777（26.3）无数据目录，
+>     内置表照常生效只是拿不到求值器
+>   - **通用类型求值器 `PacketTypeEvaluator`**：按 protocol.json 的类型树
+>     （container/array/switch/mapper/option/bitfield/topBitSetTerminatedArray/
+>     entityMetadataLoop…）读包，**按版本精确**。关键实现细节：匿名字段
+>     （Slot 的 switch）的值要并入容器结果；switch 的布尔键要匹配 "true"/"false"
+>     （Python 的 str(True) 是 "True"）；array 的 count 可以是字段名引用
+>     （"addedComponentCount"）；元数据循环的 0xFF 结束符是单字节
+>   - 由此解锁：**1.20.5+（766+）物品组件格式**（26.3 有 86 种组件，全部
+>     由类型树覆盖，零手写读取器）、**Set Equipment**、**Set Entity Metadata**
+> - **Set Slot 增量更新**：`_window_sessions`（window_id→{pos,items}）；
+>   Window Items 建会话并立即合并，Set Slot 增量改列表后幂等重合并，
+>   Close Window（双向，窗口 0=玩家物品栏忽略）落盘最终内容并清理
+> - **实体元数据**：装备 → NBT `HandItems`（主/副手）/`ArmorItems`
+>   （靴/腿/胸/头顺序，空槽写空 Compound）；血量 = 元数据 float@索引 9 →
+>   `Health`；展示框内容 = 元数据 item_stack → `Item`。装备槽 6（body/狼甲）
+>   暂不落盘
+> - **双箱内容拆分**：`_merge_items_into_root` 检测 54 格内容 + 四邻居同种箱子；
+>   1.13+ 读方块状态 `type=left/right` 精确拆分；旧版导出无属性时按
+>   「坐标小的半格拿前 27 格」确定规则（两半可能对调，内容不丢）；半格
+>   Slot 重编为 0~26
+> - **内置精确表补齐附加捕获包组**：47/754/758 补 Block Action/Open Window/
+>   Window Items/Set Slot/Close Window/Map/Spawn/Destroy/Metadata/Equipment/
+>   Teleport/Position/block_place/close（此前只有 773 完整——1.8/1.16/1.18 的
+>   容器捕获端到端其实一直没接通精确表）；777 从 wiki 补 Set Slot 0x14 /
+>   Metadata 0x65 / Equipment 0x68 / Close 0x11/0x13 等（移除了猜测错误的
+>   Entity Teleport 0x7E——777 的实体传送包已改名漂移且格式不同）；
+>   `_on_block_place` 别名接上
+> - **1.20.5+ 组件物品落盘约定**：id+数量保真，`custom_data` 内层复合写 `tag`；
+>   自定义名称/附魔等组件线上与磁盘格式不同，暂不迁移
+> - 新增测试套件 `tests/protosession_test.py`（48 断言，全合成数据不联网）；
+>   实测验证：真实 766 protocol.json 下 Window Items/Set Slot/装备/元数据全链路
 > - **新增 1.9 ~ 1.12.2（协议 107 ~ 340）区块抓取，第四个区块家族 `mid`**：
 >   - `chunk_format.py` 新增 `parse_mid_chunk_data_packet`：包结构
 >     `Int x, Int z, Bool groundUp, VarInt primaryBitMask, VarInt size, Bytes,
@@ -174,7 +210,8 @@ MinecraftProxy/
 │   ├── __init__.py              # 仅存放 __version__（2.4.0）
 │   ├── proxy.py                 # TCP 转发 + 会话生命周期
 │   ├── mirror.py                # [新增] 镜像模式服务端（agent 的明文帧 → 状态机）
-│   ├── containers.py            # [新增] Window Items 解析（三代槽位格式）
+│   ├── protocol_json.py         # [新增] protocol.json 运行时解析（精确表 + 类型求值器）
+│   ├── containers.py            # Window Items / Set Slot 解析（三代槽位 + 766+ 组件求值器）
 │   ├── maps.py                  # [新增] 地图画累积 + data/map_<id>.dat
 │   ├── entities.py              # [新增] 实体快照状态机 + entities 区域写入
 │   ├── data_tables.py           # [新增] 物品/实体 id->名称（PrismarineJS）
@@ -687,7 +724,7 @@ python -m mypy core main.py tools/precheck.py tests/realdata_test.py
 python -m ruff check .        # 预期：All checks passed!
 
 # 5. 运行测试（含自动下载方块表，首次约 10 秒）
-python run_tests.py           # 预期：全部测试通过（15 套件 / 802 断言）
+python run_tests.py           # 预期：全部测试通过（16 套件 / 850 断言）
 
 # 6. 启动代理（另开一个终端）
 python main.py --target mc.example.com:25565
@@ -750,6 +787,7 @@ tests/
 ├── onlinemode_test.py       149 行  # 正版服检测（Encryption Request / agent 安装提示）
 ├── mirror_test.py           214 行  # 镜像模式（协议 / 端到端 / STATUS 静默）
 ├── extracapture_test.py     302 行  # 附加捕获（容器 / 地图 / 实体 / 出生点 / doctor）
+├── protosession_test.py     470 行  # 运行时协议数据（求值器 / Set Slot / 装备 / 双箱）
 ├── spec_validator.py        528 行  # 独立规范校验（自写 NBT 读取器，对照真实世界）
 ├── audit.py                 157 行  # 能力边界审计（对照官方规范）
 └── fixtures/                        # 真实服务器抓包固件（.bin）
@@ -778,7 +816,7 @@ python tools/precheck.py mc.example.com:25565
 python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 ```
 
-**测试覆盖范围**：共 **802 项断言**（含 15 项误判检查），全部通过。
+**测试覆盖范围**：共 **850 项断言**（含 15 项误判检查），全部通过。
 
 | 套件 | 断言数 | 通过 |
 |---|---|---|
@@ -796,6 +834,7 @@ python tools/precheck.py mc.example.com:25565 --probe-login --protocol 773
 | `onlinemode_test.py` | 16 | ✅ 0 失败 |
 | `mirror_test.py` | 11 | ✅ 0 失败 |
 | `extracapture_test.py` | 53 | ✅ 0 失败 |
+| `protosession_test.py` | 48 | ✅ 0 失败 |
 | `spec_validator.py` | 104 | ✅ 0 失败 |
 
 > ⚠️ `spec_validator.py` 依赖本地金样本数据：真实 1.21.10 世界与官方
@@ -1037,7 +1076,7 @@ ruff、mypy 全部复验通过：
 - [ ] **数据库连接正常** — 本项目**无数据库**，确认 `core/data/blocks_773.json`（585 KB）存在
 - [ ] **本地启动成功** — `python main.py --target <离线服> ` 后 `Test-NetConnection -Port 25565` 返回 `TcpTestSucceeded : True`
 - [ ] **接口可访问** — 运行 `python main.py --help`，确认 9 个参数均列出
-- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（15 套件 / 802 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；`python main.py --doctor` 自检应输出「环境就绪」
+- [ ] **测试用例通过** — `python run_tests.py` 输出 `全部测试通过`（16 套件 / 850 断言，含 15 误判检查；金样本缺失时 spec_validator 自动跳过）；`python main.py --doctor` 自检应输出「环境就绪」
 - [ ] **静态检查通过** — `python -m mypy core main.py tools/precheck.py tests/realdata_test.py` → `Success: no issues found in 17 source files`；`python -m ruff check .` → `All checks passed!`
 - [ ] **文档已阅读理解** — 重点理解第 10 节的 9 个坑点
 - [ ] **已知问题已知晓** — 特别是「在线模式不可用」与「ViaVersion 不翻译区块负载」

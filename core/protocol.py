@@ -39,7 +39,7 @@ from .chunk_format import (
     parse_mid_chunk_data_packet,
     parse_unload_chunk_packet,
 )
-from .containers import parse_window_items
+from .containers import parse_set_slot, parse_window_items
 from .data_tables import load_name_map
 from .datatypes import PacketBuffer, write_string, write_varint
 from .entities import EntityTracker, set_current_dimension
@@ -268,6 +268,12 @@ class ProtocolParser:
         # 容器坐标关联：最近的右键/开箱候选 -> Open Screen 分配的窗口
         self._container_candidate: tuple[int, int, int] | None = None
         self._window_pos: dict[int, tuple[int, int, int]] = {}
+        # 打开中的容器窗口会话：window_id -> {pos, items}
+        # （Window Items 建立基线，Set Slot 增量更新，Close Window 落盘）
+        self._window_sessions: dict[int, dict[str, Any]] = {}
+        # protocol.json 求值器（物品组件 / 装备 / 实体元数据按版本精确解析）
+        self._proto_evaluator: Any = None
+        self._proto_evaluator_loaded_for: int | None = None
 
         # 握手改写
         self.real_host: str | None = None
@@ -403,6 +409,7 @@ class ProtocolParser:
         # 加载方块注册表（决定导出世界里的方块是否正确）
         if is_login:
             self._ensure_registry(protocol_version)
+            self._ensure_protocol_types(protocol_version)
 
         # 旧版（1.8 / 1.16 / 1.17）的生物群系 ID 是硬编码的，用内置表；
         # 1.18+ 的生物群系注册表是动态的，等 Registry Data / Registry Codec。
@@ -426,6 +433,39 @@ class ProtocolParser:
             self.registry = BlockStateRegistry()
         if not self.registry.loaded:
             logger.warning("方块注册表不可用，导出的方块将退化为空气占位")
+
+    def _ensure_protocol_types(self, protocol_version: int) -> None:
+        """
+        按协议版本加载 protocol.json（只加载一次）。
+
+        两个产物：
+        * 精确 ID 表 —— 该版本没有内置表时，把生成的表合并进 resolver，
+          包识别从「结构探测」升级为「精确匹配」（未收录的包仍走探测）；
+        * 类型求值器 —— 物品组件（1.20.5+）/ 装备 / 实体元数据按版本树解析。
+        下载失败仅降级（探测 + 三风格容器），不影响抓取主链路。
+        """
+        if self._proto_evaluator_loaded_for == protocol_version:
+            return
+        self._proto_evaluator_loaded_for = protocol_version
+        try:
+            from .protocol_json import (
+                PacketTypeEvaluator,
+                download_protocol_json,
+                extract_packet_tables,
+            )
+            proto_json = download_protocol_json(
+                protocol_version, self.world_dir, self.allow_download)
+            if proto_json is None:
+                return
+            self._proto_evaluator = PacketTypeEvaluator.for_clientbound(proto_json)
+            if not self.resolver.has_exact_table:
+                self.resolver.set_generated_tables(extract_packet_tables(proto_json))
+                logger.info(
+                    f"包 ID 解析已启用运行时精确表（协议 {protocol_version}，"
+                    "未收录的包回退结构探测）"
+                )
+        except Exception as exc:
+            logger.debug(f"加载 protocol.json 失败（已降级）: {exc}")
 
     def _on_login_start(self, payload: bytes) -> None:
         try:
@@ -957,6 +997,8 @@ class ProtocolParser:
         except Exception:
             pass
 
+    _on_block_place = _on_use_item_on   # 精确表里 1.21.x 的名字
+
     def _on_open_window(self, payload: bytes) -> None:
         """Open Screen / Open Window：把最近的候选坐标绑定到该窗口 id"""
         try:
@@ -970,24 +1012,77 @@ class ProtocolParser:
 
     _on_open_screen = _on_open_window
 
-    def _on_window_items(self, payload: bytes) -> None:
-        """Window Items：打开过的容器内容 -> extractor 合并进方块实体"""
-        content = parse_window_items(payload, self.protocol_version, self._items_table())
-        if content is None:
+    def _emit_container_items(self, window_id: int) -> None:
+        """把窗口会话里的当前物品合并进方块实体（Window Items / 关窗时调用）"""
+        session = self._window_sessions.get(window_id)
+        if session is None or not session.get("items"):
             return
-        pos = self._window_pos.pop(content.window_id, None)
-        if pos is None or not content.items:
+        pos = session.get("pos")
+        if pos is None:
             return
         x, y, z = pos
-        logger.debug(f"容器内容: ({x},{y},{z}) {len(content.items)} 组物品")
         if self.on_container_items is not None:
             try:
                 result = self.on_container_items(
-                    self.dimension_name, x, y, z, content.items)
+                    self.dimension_name, x, y, z, list(session["items"]))
                 if asyncio.iscoroutine(result):
                     self._track(result)
             except Exception:
                 logger.exception("容器内容合并失败")
+
+    def _on_window_items(self, payload: bytes) -> None:
+        """Window Items：打开过的容器内容 -> 建立窗口会话并立即合并一次"""
+        content = parse_window_items(
+            payload, self.protocol_version, self._items_table(),
+            evaluator=self._proto_evaluator)
+        if content is None:
+            return
+        pos = self._window_pos.get(content.window_id)
+        if pos is None or not content.items:
+            return
+        # 建立会话：Set Slot 在此基础上增量更新，关窗时再合并最终内容
+        self._window_sessions[content.window_id] = {
+            "pos": pos, "items": content.items,
+        }
+        logger.debug(f"容器内容: ({pos[0]},{pos[1]},{pos[2]}) {len(content.items)} 组物品")
+        self._emit_container_items(content.window_id)
+
+    def _on_set_slot(self, payload: bytes) -> None:
+        """Set Slot：容器内拿取/放入物品的增量更新"""
+        parsed = parse_set_slot(
+            payload, self.protocol_version, self._items_table(),
+            evaluator=self._proto_evaluator)
+        if parsed is None:
+            return
+        window_id, slot_index, item = parsed
+        session = self._window_sessions.get(window_id)
+        if session is None:
+            return          # 玩家物品栏（window 0）等：不是容器，忽略
+        items: list[dict[str, Any]] = session["items"]
+        if item:
+            item["Slot"] = nbt.Byte(slot_index)
+            for index, existing in enumerate(items):
+                if int(existing.get("Slot", -1)) == slot_index:
+                    items[index] = item
+                    break
+            else:
+                items.append(item)
+        else:
+            session["items"] = [e for e in items if int(e.get("Slot", -1)) != slot_index]
+        # 增量直接合并（幂等写；拖动物品会产生一小批 Set Slot，量级可接受）
+        self._emit_container_items(window_id)
+
+    def _on_close_window(self, payload: bytes) -> None:
+        """Close Window（双向）：落盘最终内容并清理会话"""
+        try:
+            buf = PacketBuffer(payload)
+            window_id = buf.read_varint()  # UByte 与 VarInt 单字节编码等价
+        except Exception:
+            return
+        if window_id in self._window_sessions:
+            self._emit_container_items(window_id)
+            self._window_sessions.pop(window_id, None)
+            self._window_pos.pop(window_id, None)
 
     def _on_map(self, payload: bytes) -> None:
         """Map Data：地图画的增量色板"""
@@ -1004,6 +1099,16 @@ class ProtocolParser:
 
     def _on_entity_teleport(self, payload: bytes) -> None:
         self.entity_tracker.on_entity_teleport(payload, self.protocol_version)
+
+    def _on_entity_equipment(self, payload: bytes) -> None:
+        """Entity Equipment：怪物装备 / 生物手持物"""
+        self.entity_tracker.on_entity_equipment(
+            payload, self._items_table(), evaluator=self._proto_evaluator)
+
+    def _on_entity_metadata(self, payload: bytes) -> None:
+        """Entity Metadata：生物血量 / 展示框内容"""
+        self.entity_tracker.on_entity_metadata(
+            payload, self._items_table(), evaluator=self._proto_evaluator)
 
     def _on_position(self, payload: bytes) -> None:
         """

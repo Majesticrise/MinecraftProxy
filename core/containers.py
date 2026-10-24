@@ -1,19 +1,24 @@
 """
-容器内容捕获：把 Window Items 包里的物品写进世界的方块实体。
+容器内容捕获：把 Window Items / Set Slot 包里的物品写进世界的方块实体。
 
 数据流（被动代理的固有限制）：
     玩家右键容器（serverbound Use Item On / Block Action 的开箱动画）
       -> 服务器发 Open Screen（分配窗口 id）+ Window Items（窗口内容）
+         + Set Slot（增量更新，拿取/放入物品时）
       -> 本模块解析物品列表，交由 extractor 合并进该坐标的 block_entities
+    玩家关窗（Close Window，双向都有）-> 最终内容再合并一次
 
 因此「打开过」的容器才有内容——这是协议设计使然，所有被动式
 world downloader 均如此。
 
-槽位线格式分三代（1.20.5+ 的组件格式暂不支持，见 parse_window_items）：
+槽位线格式（有 protocol.json 求值器时按版本树精确解析，覆盖 1.20.5+
+组件格式；否则回退到内置三风格）：
   * 1.8（47）:        [Short blockId(-1=空)][UByte count][Short damage][可选NBT]
   * 1.13 ~ 1.16.5:    [VarInt itemId(-1=空)][UByte count][可选NBT]
   * 1.17 ~ 1.20.4:    windowItems 头多一个 stateId；槽位为
                        [Bool present][VarInt id][VarInt count][可选NBT]
+  * 1.20.5+（766+）:  [VarInt count(0=空)][VarInt itemId]
+                       [VarInt 组件数 + 组件][VarInt 移除组件数 + id]
 """
 
 from __future__ import annotations
@@ -25,9 +30,9 @@ from . import nbt
 from .datatypes import PacketBuffer
 
 # 协议分界
-VERSION_ITEM_COMPONENTS_MIN = 766   # 1.20.5+：组件格式，暂不支持
 VERSION_SLOT_PRESENT_MIN = 755      # 1.17+：present bool 槽位
 VERSION_STATE_ID_MIN = 756          # 1.17.1+：Window Items 带 stateId
+VERSION_SET_SLOT_STATE_ID_MIN = 755  # 1.17+：Set Slot 带 stateId
 
 # 「物品栏格子里有多少东西」超过这个就拒绝（防御异常数据）
 MAX_SLOTS = 512
@@ -44,15 +49,21 @@ def parse_window_items(
     payload: bytes,
     protocol_version: int | None,
     item_names: dict[int, str],
+    evaluator: Any = None,
 ) -> WindowContent | None:
     """
     解析 Window Items 包；结构不符或版本不支持时返回 None（不抛异常）。
 
-    protocol_version 未知（结构探测）时依次尝试三种槽位格式，
-    以「精确消费全部字节」为准——与区块包的自适应是同一思路。
+    * evaluator（protocol.json 求值器）可用时按版本类型树精确解析，
+      覆盖 1.20.5+ 的物品组件格式；
+    * protocol_version 未知（结构探测）时依次尝试三种内置槽位格式，
+      以「精确消费全部字节」为准——与区块包的自适应是同一思路。
     """
-    if protocol_version is not None and protocol_version >= VERSION_ITEM_COMPONENTS_MIN:
-        return None  # 1.20.5+ 组件格式：规划中（见 README「已知限制」）
+    if evaluator is not None and evaluator.has_type("packet_window_items"):
+        content = _parse_window_items_evaluated(payload, item_names, evaluator)
+        if content is not None:
+            return content
+        return None
 
     if protocol_version is not None:
         styles = [_style_for(protocol_version)]
@@ -63,6 +74,86 @@ def parse_window_items(
         if content is not None:
             return content
     return None
+
+
+def _parse_window_items_evaluated(payload, item_names, evaluator) -> WindowContent | None:
+    try:
+        buf = PacketBuffer(payload)
+        value = evaluator.read_by_name(buf, "packet_window_items")
+        if not buf.at_end() or not isinstance(value, dict):
+            return None
+        window_id = int(value.get("windowId", -1))
+        raw_items = value.get("items")
+        if not isinstance(raw_items, list) or len(raw_items) > MAX_SLOTS:
+            return None
+        items: list[dict[str, Any]] = []
+        from .protocol_json import slot_to_item
+        for slot_index, raw in enumerate(raw_items):
+            entry = slot_to_item(raw, item_names)
+            if entry is None:
+                return None      # 结构不认识：整包放弃，绝不产生错位数据
+            if entry:
+                entry["Slot"] = nbt.Byte(slot_index)
+                items.append(entry)
+        return WindowContent(window_id=window_id, items=items)
+    except Exception:
+        return None
+
+
+def parse_set_slot(
+    payload: bytes,
+    protocol_version: int | None,
+    item_names: dict[int, str],
+    evaluator: Any = None,
+) -> tuple[int, int, dict[str, Any] | None] | None:
+    """
+    解析 Set Slot 包，返回 (window_id, slot_index, item)。
+
+    item 为 {} 表示该槽被清空，None 表示无法解析。
+    """
+    if evaluator is not None and evaluator.has_type("packet_set_slot"):
+        try:
+            buf = PacketBuffer(payload)
+            value = evaluator.read_by_name(buf, "packet_set_slot")
+            if not buf.at_end() or not isinstance(value, dict):
+                return None
+            from .protocol_json import slot_to_item
+            item = slot_to_item(value.get("item"), item_names)
+            if item is None:
+                return None
+            return int(value.get("windowId", -1)), int(value.get("slot", -1)), item
+        except Exception:
+            return None
+
+    # 内置格式：UByte windowId, [VarInt stateId(1.17+)], Short slot, slot
+    for with_state in _state_id_candidates(protocol_version):
+        if protocol_version is None:
+            style_candidates: list[str] = ["present", "classic", "legacy"]
+        else:
+            style_candidates = [_style_for(protocol_version)]
+        for style in style_candidates:
+            try:
+                buf = PacketBuffer(payload)
+                window_id = buf.read_ubyte()
+                if with_state:
+                    buf.read_varint()
+                slot_index = buf.read_short()
+                if not (0 <= slot_index < MAX_SLOTS):
+                    continue
+                item = _read_slot(buf, style, item_names)
+                if item is not None and buf.at_end():
+                    return window_id, slot_index, item
+            except Exception:
+                continue
+    return None
+
+
+def _state_id_candidates(protocol_version: int | None) -> list[bool]:
+    if protocol_version is None:
+        return [False, True]
+    if protocol_version >= VERSION_SET_SLOT_STATE_ID_MIN:
+        return [True]
+    return [False]
 
 
 def _style_for(protocol_version: int) -> str:

@@ -27,6 +27,9 @@ _DOWNLOAD_BASE = (
     "https://raw.githubusercontent.com/PrismarineJS/minecraft-data/master/data/pc/{ver}/{name}.json"
 )
 
+# 下载进度日志用的资源中文名
+_RESOURCE_NAMES = {"items": "物品", "entities": "实体"}
+
 
 def _shared_data_dir() -> Path:
     return Path(__file__).parent / "data"
@@ -70,6 +73,9 @@ def load_name_map(
     if allow_download and protocol_version is not None:
         for ver in _candidate_dirs(protocol_version):
             url = _DOWNLOAD_BASE.format(ver=ver, name=resource)
+            # 首连会同步下载（约几秒），打出进度避免「卡住不动」的错觉
+            logger.info(f"正在下载{_RESOURCE_NAMES.get(resource, resource)}"
+                        f"数据表（{ver}，首次运行需要联网）...")
             try:
                 with urllib.request.urlopen(url, timeout=15) as resp:
                     raw = resp.read()

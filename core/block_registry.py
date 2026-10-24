@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -430,7 +431,8 @@ def download_block_data(
     for ver in _candidate_version_dirs(protocol_version):
         url = _DOWNLOAD_BASE.format(ver=ver)
         try:
-            logger.info(f"正在下载方块数据: {url}")
+            logger.info(f"正在下载方块数据（{ver}，首次运行需要联网）...")
+            started = time.monotonic()
             with urllib.request.urlopen(url, timeout=timeout) as resp:
                 raw = resp.read()
             data = json.loads(raw.decode("utf-8"))
@@ -439,7 +441,10 @@ def download_block_data(
             payload = {"source": url, "version": ver, "blocks": data}
             with open(dest, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False)
-            logger.info(f"方块数据已缓存: {dest} (版本 {ver})")
+            logger.info(
+                f"方块数据已缓存: {dest.name} (版本 {ver}，"
+                f"耗时 {time.monotonic() - started:.1f} 秒)"
+            )
             return dest
         except Exception as exc:
             logger.debug(f"下载失败 {url}: {exc}")

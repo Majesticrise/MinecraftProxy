@@ -1,9 +1,10 @@
 """
-实体捕获（第一版：快照）。
+实体捕获（快照 + 装备/元数据）。
 
 状态机：Spawn Entity / Spawn Player -> 记录 {UUID, 类型, 坐标, 朝向}；
-        Entity Destroy -> 移除；Entity Teleport -> 刷新坐标。
-        （相对移动/元数据/装备暂不跟踪——见 README「已知限制」）
+        Entity Destroy -> 移除；Entity Teleport -> 刷新坐标；
+        Entity Equipment -> 装备（HandItems / ArmorItems）；
+        Entity Metadata -> 血量（float 索引 9）与展示框内容（item_stack）。
 
 落盘：按 1.17+ 的独立 entities 区域文件（entities/r.x.z.mca），
       区块 NBT = {DataVersion, Position: IntArray[x,z], Entities: List}，
@@ -27,9 +28,18 @@ MAX_ENTITIES = 65536          # 防御上限（真实视野内实体远少于此
 # Entity Teleport 自该版本起末尾无 onGround（1.21.2 精简）
 VERSION_TELEPORT_NO_FLAGS_MIN = 768
 
+# 展示框家族（内容物品挂在元数据里）
+_FRAME_TYPES = ("item_frame", "glow_item_frame")
+# LivingEntity 血量的元数据索引（1.14+ 为 9；更早版本略有出入，
+# 解析不到就放弃，不影响其他字段）
+_HEALTH_INDEX = 9
+
+# 装备槽 -> Anvil 键（HandItems=[主手,副手], ArmorItems=[靴,腿,胸,头]）
+_EQUIPMENT_SLOTS = {0: "hand", 1: "offhand", 2: "feet", 3: "legs", 4: "chest", 5: "head"}
+
 
 class EntityRecord:
-    __slots__ = ("type_name", "uuid_bytes", "x", "y", "z", "yaw", "pitch")
+    __slots__ = ("type_name", "uuid_bytes", "x", "y", "z", "yaw", "pitch", "extra")
 
     def __init__(self, type_name: str, uuid_bytes: bytes,
                  x: float, y: float, z: float, yaw: float, pitch: float):
@@ -40,6 +50,8 @@ class EntityRecord:
         self.z = z
         self.yaw = yaw
         self.pitch = pitch
+        # 附加信息：equipment={槽键: 物品NBT}, health=float, frame_item=物品NBT
+        self.extra: dict[str, Any] = {}
 
 
 class EntityTracker:
@@ -154,6 +166,80 @@ class EntityTracker:
         except Exception:
             return False
 
+    def on_entity_equipment(self, payload: bytes, item_names: dict[int, str],
+                            evaluator: Any = None) -> bool:
+        """
+        Entity Equipment：VarInt eid + [(UByte slot|0x80), Slot item] 循环。
+
+        需要 protocol.json 求值器（1.8 的单装备格式与 766+ 的组件物品
+        都由类型树统一覆盖）；拿不到就放弃，不影响其他捕获。
+        """
+        if evaluator is None or not evaluator.has_type("packet_entity_equipment"):
+            return False
+        try:
+            buf = PacketBuffer(payload)
+            value = evaluator.read_by_name(buf, "packet_entity_equipment")
+            if not buf.at_end() or not isinstance(value, dict):
+                return False
+            entry = self._entities.get(int(value.get("entityId", 0)))
+            if entry is None:
+                return True      # 没见过的实体（如玩家自己）：忽略
+            _dimension, record = entry
+            from .protocol_json import slot_to_item
+            equipment = record.extra.setdefault("equipment", {})
+            for pair in value.get("equipments", []):
+                if not isinstance(pair, dict):
+                    continue
+                slot = int(pair.get("slot", -1))
+                key = _EQUIPMENT_SLOTS.get(slot)
+                if key is None:
+                    continue      # 6=body（狼甲等），暂不落盘
+                item = slot_to_item(pair.get("item"), item_names)
+                if item is None:
+                    return False
+                equipment[key] = item or None
+            return True
+        except Exception:
+            return False
+
+    def on_entity_metadata(self, payload: bytes, item_names: dict[int, str],
+                           evaluator: Any = None) -> bool:
+        """
+        Entity Metadata：VarInt eid + [(UByte index)(VarInt type)(value)]×n + 0xFF。
+
+        只提取高置信字段：展示框内容（item_stack 条目）、活体血量
+        （float @ index 9）。其他元数据（粒子/姿态等）不落盘。
+        """
+        if evaluator is None or not evaluator.has_type("packet_entity_metadata"):
+            return False
+        try:
+            buf = PacketBuffer(payload)
+            value = evaluator.read_by_name(buf, "packet_entity_metadata")
+            if not buf.at_end() or not isinstance(value, dict):
+                return False
+            entry = self._entities.get(int(value.get("entityId", 0)))
+            if entry is None:
+                return True
+            _dimension, record = entry
+            is_frame = any(t in record.type_name for t in _FRAME_TYPES)
+            from .protocol_json import slot_to_item
+            for meta in value.get("metadata", []):
+                if not isinstance(meta, dict):
+                    continue
+                key = meta.get("key")
+                mtype = meta.get("type")
+                if is_frame and mtype == "item_stack" and "frame_item" not in record.extra:
+                    item = slot_to_item(meta.get("value"), item_names)
+                    if item:
+                        record.extra["frame_item"] = item
+                elif mtype == "float" and key == _HEALTH_INDEX:
+                    health_value = meta.get("value")
+                    if isinstance(health_value, (int, float)):
+                        record.extra["health"] = float(health_value)
+            return True
+        except Exception:
+            return False
+
     def _remember(self, eid: int, type_name: str, uid: bytes,
                   x: float, y: float, z: float, yaw: float, pitch: float,
                   dimension: str | None = None) -> None:
@@ -232,4 +318,23 @@ def _entity_nbt(rec: EntityRecord, data_version: int) -> dict[str, Any]:
         ])
     except Exception:
         pass
+
+    # ---- 附加信息（装备 / 血量 / 展示框内容）----
+    equipment = rec.extra.get("equipment")
+    if equipment:
+        empty = nbt.compound({})
+        entry["HandItems"] = nbt.List(nbt.TAG_COMPOUND, [
+            nbt.compound(equipment["hand"]) if equipment.get("hand") else empty,
+            nbt.compound(equipment["offhand"]) if equipment.get("offhand") else empty,
+        ])
+        entry["ArmorItems"] = nbt.List(nbt.TAG_COMPOUND, [
+            nbt.compound(equipment[key]) if equipment.get(key) else empty
+            for key in ("feet", "legs", "chest", "head")
+        ])
+    health = rec.extra.get("health")
+    if isinstance(health, float):
+        entry["Health"] = nbt.Float(health)
+    frame_item = rec.extra.get("frame_item")
+    if frame_item:
+        entry["Item"] = nbt.compound(frame_item)
     return entry
